@@ -275,6 +275,21 @@ static void hk_run_one(const ds4_hooks *h, const hook_entry *he,
     }
 
     /* parent */
+    /* Both sides call setpgid on the child: the child calls it on itself
+     * above so the group exists even if it execs before the parent runs,
+     * and the parent calls it here so the group exists even if the timeout
+     * fires (and kill(-pid, SIGKILL) below runs) before the child gets
+     * scheduled at all. Whichever call wins the race sets the same thing
+     * (the child's pgid to its own pid), so this is idempotent, not a
+     * conflict; the parent's call failing (ESRCH if the child has already
+     * exited, EACCES if it already exec'd a set-id program) is fine to
+     * ignore -- the child's own call already covers those cases. Without
+     * this, a timeout that lands before the child's first scheduled
+     * instruction would kill(-pid, ...) a process group that doesn't exist
+     * yet (ESRCH, silently a no-op since the return value isn't checked),
+     * and the subsequent blocking waitpid(pid, NULL, 0) would then hang
+     * forever on a hook that was never actually signaled. */
+    setpgid(pid, pid);
     close(in_pipe[0]);
     close(out_pipe[1]);
     close(err_pipe[1]);
@@ -301,6 +316,10 @@ static void hk_run_one(const ds4_hooks *h, const hook_entry *he,
         stdin_open = false;
     }
 
+    /* out_buf (the hook's stdout) is read and capped the same way err_buf
+     * is, but purely to keep the pipe drained so a chatty hook can never
+     * backpressure-block on a full stdout pipe -- its contents are never
+     * surfaced anywhere (only stderr becomes block_reason on exit 2). */
     char *out_buf = malloc(DS4_HOOKS_CAP_BYTES);
     char *err_buf = malloc(DS4_HOOKS_CAP_BYTES);
     size_t out_len = 0, err_len = 0;
