@@ -279,6 +279,8 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "-p, --prompt TEXT", "Submit an initial prompt after startup.");
     opt(fp, c, "--non-interactive", "Run without TUI. With -p: one turn; without -p: repeated stdin prompts.");
     opt(fp, c, "--auto-approve", "Automatically approve permissions.confirm tools instead of asking or refusing.");
+    opt(fp, c, "--continue", "Resume the most recently saved session.");
+    opt(fp, c, "--resume SHA", "Resume a specific saved session by SHA prefix.");
     opt(fp, c, "-sys, --system TEXT", "Extra system prompt. Empty disables extra text.");
     opt(fp, c, "--trace FILE", "Write prompt, token, and DSML debug trace.");
     opt(fp, c, "--chdir DIR", "Change working directory before loading runtime assets.");

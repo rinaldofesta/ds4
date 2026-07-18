@@ -73,6 +73,8 @@ typedef struct {
     const char *chdir_path;
     bool non_interactive;
     bool auto_approve;
+    bool continue_last;
+    const char *resume_sha;
 } agent_config;
 
 typedef enum {
@@ -562,6 +564,16 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
     return argv[++(*i)];
 }
 
+/* --continue resumes the most recent saved session; --resume <sha> resumes a
+ * specific one.  Passing both is ambiguous, so parse_options rejects it. */
+static bool agent_flags_conflict(const agent_config *c, char *err, size_t err_len) {
+    if (c->continue_last && c->resume_sha) {
+        snprintf(err, err_len, "--continue and --resume are mutually exclusive");
+        return true;
+    }
+    return false;
+}
+
 static agent_config parse_options(int argc, char **argv) {
     agent_config c = {
         .engine = {
@@ -613,6 +625,10 @@ static agent_config parse_options(int argc, char **argv) {
             c.non_interactive = true;
         } else if (!strcmp(arg, "--auto-approve")) {
             c.auto_approve = true;
+        } else if (!strcmp(arg, "--continue")) {
+            c.continue_last = true;
+        } else if (!strcmp(arg, "--resume")) {
+            c.resume_sha = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--trace")) {
@@ -728,6 +744,11 @@ static agent_config parse_options(int argc, char **argv) {
     }
     if (c.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
         fprintf(stderr, "ds4-agent: --role worker is a serving mode; start workers with ./ds4\n");
+        exit(2);
+    }
+    char flags_err[128];
+    if (agent_flags_conflict(&c, flags_err, sizeof(flags_err))) {
+        fprintf(stderr, "ds4-agent: %s\n", flags_err);
         exit(2);
     }
     return c;
@@ -4195,6 +4216,19 @@ static void agent_publishf_system_status(agent_worker *w, const char *fmt, ...) 
     free(heap);
 }
 
+/* agent_publish_system_status() is a silent no-op when cfg->non_interactive
+ * (see above), so a startup resume/continue status would otherwise vanish
+ * in that mode. Mirror the same non_interactive-vs-interactive split
+ * agent_worker_init() already uses for its own startup warnings: stderr when
+ * non-interactive, the buffered system-status line otherwise. */
+static void agent_worker_publish_startup_status(agent_worker *w, const char *msg) {
+    if (w->cfg->non_interactive) {
+        fprintf(stderr, "ds4-agent: %s\n", msg);
+    } else {
+        agent_publish_system_status(w, msg);
+    }
+}
+
 static int agent_web_confirm(void *privdata, const char *message,
                              char *err, size_t err_len) {
     agent_worker *w = privdata;
@@ -5224,14 +5258,24 @@ static void agent_session_list_push(agent_session_list_item **v, int *len,
     };
 }
 
-/* Print resumable sessions from ~/.ds4/kvcache.  sysprompt.kv is intentionally
- * ignored because it is an implementation cache, not a user session. */
-static void agent_worker_list_sessions(agent_worker *w) {
+/* Gather resumable sessions from ~/.ds4/kvcache for the current model,
+ * sorted most-recent-first (the exact scan + trailer parse + sort that
+ * agent_worker_list_sessions used to do inline). sysprompt.kv -- and Task
+ * 11's future sysprompt-<sha>.kv files -- are never returned: they're
+ * filtered by name via ds4_kvstore_sha_hex_name(), which only accepts
+ * exactly 40 hex chars + ".kv" (43 bytes total). Neither "sysprompt.kv" nor
+ * any "sysprompt-*.kv" name matches that shape, so this filter is already
+ * robust to both without an added prefix check.
+ *
+ * Returns the entry count and sets *out to a freshly allocated, sorted array
+ * (NULL if 0), or returns -1 with *out NULL if the cache directory itself
+ * could not be opened (errno is left as opendir() set it). Callers that only
+ * need "is there anything to resume" can treat <= 0 as one case. */
+static int agent_session_list_query(agent_worker *w,
+                                    agent_session_list_item **out) {
+    *out = NULL;
     DIR *d = opendir(w->cache_dir);
-    if (!d) {
-        printf("no sessions: %s\n", strerror(errno));
-        return;
-    }
+    if (!d) return -1;
 
     int cols = renderer_terminal_cols();
     size_t title_budget = cols > 16 ? (size_t)(cols - 12) : 20;
@@ -5258,13 +5302,27 @@ static void agent_worker_list_sessions(agent_worker *w) {
         free(path);
     }
     closedir(d);
+    if (sessions_len) {
+        qsort(sessions, (size_t)sessions_len, sizeof(sessions[0]),
+              agent_session_list_cmp_recent);
+    }
+    *out = sessions;
+    return sessions_len;
+}
+
+/* Print resumable sessions from ~/.ds4/kvcache.  sysprompt.kv is intentionally
+ * ignored because it is an implementation cache, not a user session. */
+static void agent_worker_list_sessions(agent_worker *w) {
+    agent_session_list_item *sessions = NULL;
+    int sessions_len = agent_session_list_query(w, &sessions);
+    if (sessions_len < 0) {
+        printf("no sessions: %s\n", strerror(errno));
+        return;
+    }
     if (!sessions_len) {
         printf("no saved sessions\n");
         return;
     }
-
-    qsort(sessions, (size_t)sessions_len, sizeof(sessions[0]),
-          agent_session_list_cmp_recent);
 
     bool color = isatty(STDOUT_FILENO) != 0;
     const char *sha_on = color ? "\x1b[1;96m" : "";
@@ -6825,6 +6883,139 @@ static void test_agent_project_memory_load(void) {
     rmdir(fx);
 }
 
+/* agent_flags_conflict() is a pure function of agent_config -- no worker, no
+ * engine -- so the --continue/--resume mutual exclusion check is testable
+ * directly: both set is a conflict, either alone or neither is not. */
+static void test_agent_flags_conflict(void) {
+    {
+        agent_config c = {0};
+        c.continue_last = true;
+        c.resume_sha = "deadbeef";
+        char err[128] = {0};
+        AGENT_TEST_ASSERT(agent_flags_conflict(&c, err, sizeof(err)));
+        AGENT_TEST_ASSERT(err[0] != '\0');
+    }
+    {
+        agent_config c = {0};
+        c.continue_last = true;
+        char err[128] = {0};
+        AGENT_TEST_ASSERT(!agent_flags_conflict(&c, err, sizeof(err)));
+    }
+    {
+        agent_config c = {0};
+        c.resume_sha = "deadbeef";
+        char err[128] = {0};
+        AGENT_TEST_ASSERT(!agent_flags_conflict(&c, err, sizeof(err)));
+    }
+    {
+        agent_config c = {0};
+        char err[128] = {0};
+        AGENT_TEST_ASSERT(!agent_flags_conflict(&c, err, sizeof(err)));
+    }
+}
+
+/* parse_options() exits the process on a bad/conflicting flag, which would
+ * kill this test binary -- so this only drives argv shapes that parse
+ * cleanly, confirming --continue/--resume land in the right fields and
+ * everything else stays at its default. The --continue+--resume conflict
+ * exit() path is exercised via agent_flags_conflict() directly, above. */
+static void test_agent_parse_options_resume_flags(void) {
+    {
+        char *argv[] = { (char *)"ds4-agent", (char *)"--continue" };
+        agent_config c = parse_options(2, argv);
+        AGENT_TEST_ASSERT(c.continue_last);
+        AGENT_TEST_ASSERT(c.resume_sha == NULL);
+    }
+    {
+        char *argv[] = { (char *)"ds4-agent", (char *)"--resume", (char *)"deadbeef" };
+        agent_config c = parse_options(3, argv);
+        AGENT_TEST_ASSERT(!c.continue_last);
+        AGENT_TEST_ASSERT(c.resume_sha != NULL && !strcmp(c.resume_sha, "deadbeef"));
+    }
+    {
+        char *argv[] = { (char *)"ds4-agent" };
+        agent_config c = parse_options(1, argv);
+        AGENT_TEST_ASSERT(!c.continue_last);
+        AGENT_TEST_ASSERT(c.resume_sha == NULL);
+    }
+}
+
+/* agent_session_list_query() on a cache_dir that was never created (opendir
+ * fails) returns -1 with *out left NULL; an existing-but-empty directory
+ * returns 0 with *out left NULL. Both are "nothing to resume" for callers
+ * that only test count > 0, but the query keeps them distinguishable so
+ * agent_worker_list_sessions can still print its original "no sessions:
+ * <errno>" vs "no saved sessions" messages unchanged. w.engine stays NULL:
+ * ds4_engine_model_id() ignores it (returns a fixed constant). */
+static void test_agent_session_list_query_empty_or_missing_dir(void) {
+    char tmpl[] = "/tmp/ds4_agent_session_query_missing_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    AGENT_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    char missing_dir[PATH_MAX];
+    snprintf(missing_dir, sizeof(missing_dir), "%s/kvcache-missing", fx);
+
+    agent_worker w = {0};
+    w.cache_dir = missing_dir;
+    agent_session_list_item *sessions = NULL;
+    int n = agent_session_list_query(&w, &sessions);
+    AGENT_TEST_ASSERT(n < 0);
+    AGENT_TEST_ASSERT(sessions == NULL);
+
+    char empty_dir[PATH_MAX];
+    snprintf(empty_dir, sizeof(empty_dir), "%s/kvcache-empty", fx);
+    AGENT_TEST_ASSERT(mkdir(empty_dir, 0700) == 0);
+    w.cache_dir = empty_dir;
+    sessions = NULL;
+    n = agent_session_list_query(&w, &sessions);
+    AGENT_TEST_ASSERT(n == 0);
+    AGENT_TEST_ASSERT(sessions == NULL);
+
+    rmdir(empty_dir);
+    rmdir(fx);
+}
+
+/* Filename-filter robustness for Task 11: ds4_kvstore_sha_hex_name() requires
+ * an exact 40 hex chars + ".kv" (43 bytes total), so a fixed "sysprompt.kv"
+ * and a future "sysprompt-<hex16>.kv" are both already excluded by shape
+ * alone, with no dedicated sysprompt-prefix check needed. A non-.kv file is
+ * excluded the same way. None of these dummy files hold a real KV header,
+ * so a crash here would mean the filter let an unparseable name through. */
+static void test_agent_session_list_query_filters_non_session_filenames(void) {
+    char tmpl[] = "/tmp/ds4_agent_session_query_filter_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    AGENT_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    static const char *names[] = {
+        "sysprompt.kv",
+        "sysprompt-0123456789abcdef.kv",
+        "notes.txt",
+    };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s", fx, names[i]);
+        FILE *fp = fopen(path, "wb");
+        AGENT_TEST_ASSERT(fp != NULL);
+        if (fp) { fputs("not a real kv file", fp); fclose(fp); }
+    }
+
+    agent_worker w = {0};
+    w.cache_dir = fx;
+    agent_session_list_item *sessions = NULL;
+    int n = agent_session_list_query(&w, &sessions);
+    AGENT_TEST_ASSERT(n == 0);
+    AGENT_TEST_ASSERT(sessions == NULL);
+
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s", fx, names[i]);
+        unlink(path);
+    }
+    rmdir(fx);
+}
+
 static void ds4_agent_unit_tests_run(void) {
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
@@ -6834,6 +7025,10 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_tool_call_subject_extraction();
     test_agent_permission_gate();
     test_agent_project_memory_load();
+    test_agent_flags_conflict();
+    test_agent_parse_options_resume_flags();
+    test_agent_session_list_query_empty_or_missing_dir();
+    test_agent_session_list_query_filters_non_session_filenames();
 }
 #endif
 
@@ -8939,6 +9134,51 @@ static void *worker_main(void *arg) {
     w->initialized = true;
     agent_wake_locked(w);
     pthread_mutex_unlock(&w->mu);
+
+    /* --continue/--resume: agent_worker_switch_session() requires
+     * worker_is_idle(), which requires w->initialized, so the sysprompt reset
+     * above must always run first regardless of these flags -- there is no
+     * live, idle session to switch into before that point. That reset is
+     * also already the fallback on any resume failure below: agent_kv_load_
+     * path() invalidates the live KV session on some of its failure paths
+     * (model/quant mismatch, bad payload), so it must be resynchronized, and
+     * a second reset_to_sysprompt() call does that; it should still hit the
+     * sysprompt.kv cache and stay cheap. History is intentionally not shown
+     * here (history_turns=0): agent_worker_switch_session()'s own progress
+     * lines already go straight to stdout, ahead of the editor/queue
+     * plumbing that fully applies once the main loop below is running. */
+    if (w->cfg->resume_sha) {
+        char resume_err[160] = {0};
+        if (!agent_worker_switch_session(w, w->cfg->resume_sha, 0,
+                                         resume_err, sizeof(resume_err))) {
+            char status[300];
+            snprintf(status, sizeof(status), "Could not resume %s: %s; starting fresh",
+                     w->cfg->resume_sha, resume_err);
+            agent_worker_publish_startup_status(w, status);
+            char reset_err[160] = {0};
+            if (!agent_worker_reset_to_sysprompt(w, reset_err, sizeof(reset_err)))
+                agent_set_error(w, reset_err[0] ? reset_err : "failed to initialize system prompt");
+        }
+    } else if (w->cfg->continue_last) {
+        agent_session_list_item *items = NULL;
+        int n = agent_session_list_query(w, &items);
+        if (n > 0) {
+            char resume_err[160] = {0};
+            if (!agent_worker_switch_session(w, items[0].entry.sha, 0,
+                                             resume_err, sizeof(resume_err))) {
+                char status[300];
+                snprintf(status, sizeof(status), "Could not resume %s: %s; starting fresh",
+                         items[0].entry.sha, resume_err);
+                agent_worker_publish_startup_status(w, status);
+                char reset_err[160] = {0};
+                if (!agent_worker_reset_to_sysprompt(w, reset_err, sizeof(reset_err)))
+                    agent_set_error(w, reset_err[0] ? reset_err : "failed to initialize system prompt");
+            }
+        } else {
+            agent_worker_publish_startup_status(w, "No saved sessions; starting fresh");
+        }
+        agent_session_list_free(items, n > 0 ? n : 0);
+    }
 
     while (true) {
         pthread_mutex_lock(&w->mu);
