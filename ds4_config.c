@@ -1,4 +1,6 @@
 #include "ds4_config.h"
+#include <ctype.h>
+#include <dirent.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,12 +23,26 @@
 #define DS4_CONFIG_MAX_SETTINGS_SIZE (1u << 20) /* 1 MiB */
 #define DS4_CONFIG_MAX_WALK_LEVELS 64
 
+/* One search root. Base roots (project_ds4_dir, user_ds4_dir) are aliased in
+ * here -- dir points at the same allocation as the corresponding ds4_config
+ * field, not a copy, so ds4_config_root_at(c, i) stays pointer-identical to
+ * ds4_config_project_ds4_dir(c)/ds4_config_user_ds4_dir(c) for those indices
+ * (existing callers/tests rely on that identity). Plugin roots own their dir
+ * and plugin_name allocations. */
+typedef struct {
+    char *dir;
+    char *plugin_name; /* NULL for a base root */
+    bool dir_owned;
+} ds4_config_root_entry;
+
 struct ds4_config {
     char *project_root;    /* NULL if none */
     char *project_ds4_dir; /* "<root>/.ds4", NULL if no root */
     char *user_ds4_dir;    /* "<home>/.ds4", NULL if no HOME */
     ds4_json_value *project_settings; /* NULL if absent/malformed/no root */
     ds4_json_value *user_settings;    /* NULL if absent/malformed/no HOME */
+    ds4_config_root_entry *roots;
+    int root_count, root_cap;
 };
 
 static char *cfg_strdup(const char *s) {
@@ -168,6 +184,123 @@ static ds4_json_value *cfg_load_settings(const char *path, char *warn, size_t wa
     return v;
 }
 
+/* Appends one search root entry. dir_owned marks whether ds4_config_free
+ * must free(dir) itself (plugin roots) or leave it alone (base roots, which
+ * alias project_ds4_dir/user_ds4_dir). plugin_name is always owned when
+ * non-NULL. Returns false (and leaves *c untouched otherwise) only on
+ * allocation failure. */
+static bool cfg_root_push(ds4_config *c, char *dir, bool dir_owned, char *plugin_name) {
+    if (c->root_count == c->root_cap) {
+        int newcap = c->root_cap ? c->root_cap * 2 : 4;
+        ds4_config_root_entry *nv = realloc(c->roots, (size_t)newcap * sizeof(*nv));
+        if (!nv) return false;
+        c->roots = nv;
+        c->root_cap = newcap;
+    }
+    c->roots[c->root_count].dir = dir;
+    c->roots[c->root_count].dir_owned = dir_owned;
+    c->roots[c->root_count].plugin_name = plugin_name;
+    c->root_count++;
+    return true;
+}
+
+/* name must match [A-Za-z0-9][A-Za-z0-9_-]{0,63} -- same rule as skill and
+ * command names (ds4_skills.c/ds4_commands.c), since a plugin name is really
+ * just one more directory-name-derived identifier. */
+static bool cfg_valid_plugin_name(const char *s) {
+    size_t n = strlen(s);
+    if (n < 1 || n > 64) return false;
+    if (!isalnum((unsigned char)s[0])) return false;
+    for (size_t i = 1; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (!(isalnum(c) || c == '_' || c == '-')) return false;
+    }
+    return true;
+}
+
+typedef struct { char *name; char *dir; } cfg_plugin_entry;
+
+static int cfg_plugin_cmp_name(const void *a, const void *b) {
+    const cfg_plugin_entry *pa = (const cfg_plugin_entry *)a;
+    const cfg_plugin_entry *pb = (const cfg_plugin_entry *)b;
+    return strcmp(pa->name, pb->name);
+}
+
+/* Enumerates the directory entries of <base_ds4_dir>/plugins/ (directories
+ * only, symlinks to a directory count), sorted by strcmp(name) for
+ * determinism -- readdir()
+ * order is not stable across filesystems/runs (same rationale as the
+ * ds4_skills per-root sort). A missing plugins/ dir is not an error (silent,
+ * out/out_len left at NULL/0). An entry that is not a directory is
+ * silently skipped (mirrors how skills/commands treat a stray file); an
+ * entry that IS a directory but fails the name pattern is skipped with a
+ * warning. On return, *out is a malloc'd array (caller frees the array and,
+ * for every entry, .name and .dir -- ownership of both is handed to the
+ * caller, typically straight into the config's root list). */
+static void cfg_discover_plugins(const char *base_ds4_dir, cfg_plugin_entry **out, int *out_len,
+                                 char *warn, size_t warn_len) {
+    *out = NULL;
+    *out_len = 0;
+
+    char *plugins_dir = cfg_join(base_ds4_dir, "plugins");
+    if (!plugins_dir) return;
+
+    DIR *d = opendir(plugins_dir);
+    if (!d) {
+        free(plugins_dir);
+        return; /* no plugins/ dir at all: not an error */
+    }
+
+    cfg_plugin_entry *v = NULL;
+    int len = 0, cap = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+
+        char *entry_path = cfg_join(plugins_dir, de->d_name);
+        if (!entry_path) continue;
+        if (!cfg_is_dir(entry_path)) {
+            free(entry_path);
+            continue;
+        }
+        if (!cfg_valid_plugin_name(de->d_name)) {
+            cfg_warn_append(warn, warn_len, entry_path, "invalid plugin name, skipped");
+            free(entry_path);
+            continue;
+        }
+
+        if (len == cap) {
+            cap = cap ? cap * 2 : 4;
+            v = realloc(v, (size_t)cap * sizeof(v[0]));
+        }
+        v[len].name = cfg_strdup(de->d_name);
+        v[len].dir = entry_path;
+        len++;
+    }
+    closedir(d);
+    free(plugins_dir);
+
+    if (len > 1) qsort(v, (size_t)len, sizeof(v[0]), cfg_plugin_cmp_name);
+
+    *out = v;
+    *out_len = len;
+}
+
+/* Pushes a base root (if present) followed by its sorted plugin roots.
+ * base_dir/dir_owned=false is the ds4_config_root_at pointer-identity
+ * contract described on ds4_config_root_entry; plugin roots are owned. */
+static void cfg_push_base_and_plugins(ds4_config *c, char *base_dir, char *warn, size_t warn_len) {
+    if (!base_dir) return;
+    cfg_root_push(c, base_dir, false, NULL);
+
+    cfg_plugin_entry *plugins = NULL;
+    int nplugins = 0;
+    cfg_discover_plugins(base_dir, &plugins, &nplugins, warn, warn_len);
+    for (int i = 0; i < nplugins; i++)
+        cfg_root_push(c, plugins[i].dir, true, plugins[i].name);
+    free(plugins); /* ownership of .dir/.name moved into c->roots above */
+}
+
 ds4_config *ds4_config_load(const char *start_dir, char *warn, size_t warn_len) {
     if (warn && warn_len) warn[0] = '\0';
 
@@ -215,6 +348,14 @@ ds4_config *ds4_config_load(const char *start_dir, char *warn, size_t warn_len) 
         free(settings_path);
     }
 
+    /* Final root order: project base, project plugins (sorted), user base,
+     * user plugins (sorted) -- see ds4_config.h. With no plugins/ dir
+     * anywhere this produces exactly the pre-plugin two-root list, and
+     * ds4_config_root_at keeps returning the base dirs by the same pointer
+     * (cfg_push_base_and_plugins passes dir_owned=false for them). */
+    cfg_push_base_and_plugins(c, c->project_ds4_dir, warn, warn_len);
+    cfg_push_base_and_plugins(c, c->user_ds4_dir, warn, warn_len);
+
     return c;
 }
 
@@ -225,6 +366,11 @@ void ds4_config_free(ds4_config *c) {
     free(c->user_ds4_dir);
     ds4_json_free(c->project_settings);
     ds4_json_free(c->user_settings);
+    for (int i = 0; i < c->root_count; i++) {
+        if (c->roots[i].dir_owned) free(c->roots[i].dir);
+        free(c->roots[i].plugin_name);
+    }
+    free(c->roots);
     free(c);
 }
 
@@ -248,29 +394,25 @@ const ds4_json_value *ds4_config_get(const ds4_config *c, const char *key) {
 }
 
 int ds4_config_root_count(const ds4_config *c) {
-    if (!c) return 0;
-    int n = 0;
-    if (c->project_ds4_dir) n++;
-    if (c->user_ds4_dir) n++;
-    return n;
+    return c ? c->root_count : 0;
 }
 
 const char *ds4_config_root_at(const ds4_config *c, int i) {
-    if (!c || i < 0) return NULL;
-    int idx = 0;
-    if (c->project_ds4_dir) {
-        if (idx == i) return c->project_ds4_dir;
-        idx++;
-    }
-    if (c->user_ds4_dir) {
-        if (idx == i) return c->user_ds4_dir;
-        idx++;
-    }
-    return NULL;
+    if (!c || i < 0 || i >= c->root_count) return NULL;
+    return c->roots[i].dir;
+}
+
+bool ds4_config_root_is_plugin(const ds4_config *c, int i) {
+    if (!c || i < 0 || i >= c->root_count) return false;
+    return c->roots[i].plugin_name != NULL;
+}
+
+const char *ds4_config_root_plugin_name(const ds4_config *c, int i) {
+    if (!c || i < 0 || i >= c->root_count) return NULL;
+    return c->roots[i].plugin_name;
 }
 
 #ifdef DS4_CONFIG_TEST
-#include <dirent.h>
 
 static int cfg_test_failures;
 
@@ -592,6 +734,11 @@ static void test_missing_and_malformed_settings(void) {
     cfg_test_rmtree(fx);
 }
 
+/* This test's fixture has no .ds4/plugins/ anywhere, so it doubles as the
+ * "no plugins dir -> byte-identical to pre-plugins root list" lock: root
+ * count, pointer identity of the two base roots, and the new is_plugin/
+ * plugin_name accessors must all come back exactly as they did before this
+ * task (false/NULL for every root). */
 static void test_roots_listing(void) {
     char tmpl[] = "/tmp/ds4_cfg_roots_test.XXXXXX";
     char *fx = mkdtemp(tmpl);
@@ -617,6 +764,13 @@ static void test_roots_listing(void) {
         CFG_TEST_ASSERT(r0 != NULL && r0 == ds4_config_project_ds4_dir(c));
         CFG_TEST_ASSERT(r1 != NULL && r1 == ds4_config_user_ds4_dir(c));
         CFG_TEST_ASSERT(ds4_config_root_at(c, 2) == NULL);
+
+        CFG_TEST_ASSERT(!ds4_config_root_is_plugin(c, 0));
+        CFG_TEST_ASSERT(ds4_config_root_plugin_name(c, 0) == NULL);
+        CFG_TEST_ASSERT(!ds4_config_root_is_plugin(c, 1));
+        CFG_TEST_ASSERT(ds4_config_root_plugin_name(c, 1) == NULL);
+        CFG_TEST_ASSERT(!ds4_config_root_is_plugin(c, 2));
+        CFG_TEST_ASSERT(ds4_config_root_plugin_name(c, 2) == NULL);
     }
     ds4_config_free(c);
 
@@ -627,11 +781,113 @@ static void test_roots_listing(void) {
         CFG_TEST_ASSERT(ds4_config_root_count(c) == 1);
         CFG_TEST_ASSERT(ds4_config_root_at(c, 0) == ds4_config_project_ds4_dir(c));
         CFG_TEST_ASSERT(ds4_config_user_ds4_dir(c) == NULL);
+        CFG_TEST_ASSERT(!ds4_config_root_is_plugin(c, 0));
     }
     ds4_config_free(c);
 
     cfg_test_restore_home(saved_home);
     free(proj); free(proj_ds4); free(home);
+    cfg_test_rmtree(fx);
+}
+
+/* Root order fixture: project root + 2 project plugins (created out of
+ * alpha order on disk) + user root + 1 user plugin -> count 5, exact
+ * expected order, is_plugin/plugin_name correct. Also covers an
+ * invalid-plugin-name directory (skipped + warned) and a stray non-directory
+ * entry under plugins/ (silently ignored, not warned). */
+static void test_plugin_root_ordering(void) {
+    char tmpl[] = "/tmp/ds4_cfg_plugins_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    CFG_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    char *proj = cfg_test_join(fx, "proj");
+    char *proj_ds4 = cfg_test_join(proj, ".ds4");
+    cfg_test_mkdir_p(proj_ds4);
+
+    /* deliberately created zeta before alpha, so the test can't pass just
+     * because readdir() happened to return entries in sorted order */
+    char *proj_plug_zeta = cfg_test_join(proj_ds4, "plugins/zeta");
+    char *proj_plug_alpha = cfg_test_join(proj_ds4, "plugins/alpha");
+    cfg_test_mkdir_p(proj_plug_zeta);
+    cfg_test_mkdir_p(proj_plug_alpha);
+
+    /* invalid plugin name (space): a real directory, skipped + warned */
+    char *proj_plug_bad = cfg_test_join(proj_ds4, "plugins/bad name");
+    cfg_test_mkdir_p(proj_plug_bad);
+
+    /* an otherwise validly-named but non-directory entry: silently ignored,
+     * mirrors how ds4_skills treats a stray file under skills/ */
+    char *proj_plug_file = cfg_test_join(proj_ds4, "plugins/notadir");
+    cfg_test_write_file(proj_plug_file, "x");
+
+    char *home = cfg_test_join(fx, "home");
+    char *home_ds4 = cfg_test_join(home, ".ds4");
+    cfg_test_mkdir_p(home_ds4);
+    char *home_plug = cfg_test_join(home_ds4, "plugins/gamma");
+    cfg_test_mkdir_p(home_plug);
+
+    char *saved_home;
+    cfg_test_setenv_home(home, &saved_home);
+
+    char warn[1024] = {0};
+    ds4_config *c = ds4_config_load(proj, warn, sizeof(warn));
+    CFG_TEST_ASSERT(c != NULL);
+    if (c) {
+        CFG_TEST_ASSERT(ds4_config_root_count(c) == 5);
+        CFG_TEST_ASSERT(strstr(warn, "invalid plugin name") != NULL);
+
+        const char *r0 = ds4_config_root_at(c, 0);
+        CFG_TEST_ASSERT(r0 == ds4_config_project_ds4_dir(c));
+        CFG_TEST_ASSERT(!ds4_config_root_is_plugin(c, 0));
+        CFG_TEST_ASSERT(ds4_config_root_plugin_name(c, 0) == NULL);
+
+        const char *r1 = ds4_config_root_at(c, 1);
+        CFG_TEST_ASSERT(ds4_config_root_is_plugin(c, 1));
+        CFG_TEST_ASSERT(r1 != NULL);
+        const char *n1 = ds4_config_root_plugin_name(c, 1);
+        CFG_TEST_ASSERT(n1 != NULL && strcmp(n1, "alpha") == 0);
+        if (r1) {
+            char expected[PATH_MAX];
+            snprintf(expected, sizeof(expected), "%s/plugins/alpha", ds4_config_project_ds4_dir(c));
+            CFG_TEST_ASSERT(strcmp(r1, expected) == 0);
+        }
+
+        const char *r2 = ds4_config_root_at(c, 2);
+        CFG_TEST_ASSERT(ds4_config_root_is_plugin(c, 2));
+        const char *n2 = ds4_config_root_plugin_name(c, 2);
+        CFG_TEST_ASSERT(n2 != NULL && strcmp(n2, "zeta") == 0);
+        if (r2) {
+            char expected[PATH_MAX];
+            snprintf(expected, sizeof(expected), "%s/plugins/zeta", ds4_config_project_ds4_dir(c));
+            CFG_TEST_ASSERT(strcmp(r2, expected) == 0);
+        }
+
+        const char *r3 = ds4_config_root_at(c, 3);
+        CFG_TEST_ASSERT(r3 == ds4_config_user_ds4_dir(c));
+        CFG_TEST_ASSERT(!ds4_config_root_is_plugin(c, 3));
+        CFG_TEST_ASSERT(ds4_config_root_plugin_name(c, 3) == NULL);
+
+        const char *r4 = ds4_config_root_at(c, 4);
+        CFG_TEST_ASSERT(ds4_config_root_is_plugin(c, 4));
+        const char *n4 = ds4_config_root_plugin_name(c, 4);
+        CFG_TEST_ASSERT(n4 != NULL && strcmp(n4, "gamma") == 0);
+        if (r4) {
+            char expected[PATH_MAX];
+            snprintf(expected, sizeof(expected), "%s/plugins/gamma", ds4_config_user_ds4_dir(c));
+            CFG_TEST_ASSERT(strcmp(r4, expected) == 0);
+        }
+
+        CFG_TEST_ASSERT(ds4_config_root_at(c, 5) == NULL);
+        CFG_TEST_ASSERT(!ds4_config_root_is_plugin(c, 5));
+        CFG_TEST_ASSERT(ds4_config_root_plugin_name(c, 5) == NULL);
+    }
+    ds4_config_free(c);
+
+    cfg_test_restore_home(saved_home);
+    free(proj); free(proj_ds4); free(proj_plug_zeta); free(proj_plug_alpha);
+    free(proj_plug_bad); free(proj_plug_file);
+    free(home); free(home_ds4); free(home_plug);
     cfg_test_rmtree(fx);
 }
 
@@ -675,6 +931,7 @@ int ds4_config_unit_tests_run(void) {
     test_missing_and_malformed_settings();
     test_roots_listing();
     test_neither_root_accessors();
+    test_plugin_root_ordering();
     return cfg_test_failures;
 }
 #endif

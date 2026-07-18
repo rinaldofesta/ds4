@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/select.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -25,6 +26,7 @@
 #define DS4_HOOKS_DEFAULT_TIMEOUT_MS 10000
 #define DS4_HOOKS_CAP_BYTES (64u * 1024) /* stdout/stderr capture cap */
 #define DS4_HOOKS_READ_CHUNK 8192
+#define DS4_HOOKS_MAX_FILE_SIZE (1u << 20) /* 1 MiB, mirrors ds4_config's settings cap */
 
 static char *hk_strdup(const char *s) {
     size_t n = strlen(s);
@@ -62,7 +64,36 @@ static void hk_warn_append(char *warn, size_t warn_len, const char *ctx, const c
     snprintf(warn + cur, warn_len - cur, "hooks: %s: %s\n", ctx, problem);
 }
 
-/* ---- settings.json parsing ---- */
+/* Deliberately not depending on ds4_kvstore_path_join, mirroring every other
+ * content module (ds4_config, ds4_skills, ds4_commands, ds4_mcp). */
+static char *hk_join(const char *dir, const char *name) {
+    size_t dlen = strlen(dir);
+    int need_slash = dlen > 0 && dir[dlen - 1] != '/';
+    size_t nlen = strlen(name);
+    char *out = malloc(dlen + (need_slash ? 1 : 0) + nlen + 1);
+    if (!out) return NULL;
+    memcpy(out, dir, dlen);
+    size_t pos = dlen;
+    if (need_slash) out[pos++] = '/';
+    memcpy(out + pos, name, nlen);
+    pos += nlen;
+    out[pos] = '\0';
+    return out;
+}
+
+/* If plugin_dir is non-NULL and command starts with "./", resolves it
+ * against plugin_dir (drops the "./" and prefixes "<plugin_dir>/"), so a
+ * plugin's hooks.json stays relocatable regardless of ds4-agent's cwd or the
+ * project root. Otherwise returns an unmodified copy -- settings.json hooks
+ * already run with cwd = project root (see ds4_hooks.h), so they need no
+ * such rewrite. */
+static char *hk_resolve_command(const char *command, const char *plugin_dir) {
+    if (plugin_dir && command[0] == '.' && command[1] == '/')
+        return hk_fmt("%s/%s", plugin_dir, command + 2);
+    return hk_strdup(command);
+}
+
+/* ---- settings.json / plugin hooks.json parsing ---- */
 
 typedef struct {
     char *matcher;   /* fnmatch glob, never NULL, defaults to "*" */
@@ -100,46 +131,51 @@ static bool hk_event_from_key(const char *key, ds4_hook_event *out) {
     return false;
 }
 
-ds4_hooks *ds4_hooks_load(const ds4_config *cfg, char *warn, size_t warn_len) {
-    if (warn && warn_len) warn[0] = '\0';
-    if (!cfg) return NULL;
-
-    /* Task-2 config merge (ds4_config_get): a "hooks" key present in the
-     * project settings.json is used in full, in place of the user one --
-     * no deep merge across files, and no merge across the PreToolUse /
-     * PostToolUse arrays of two different files. Fetching the key once here
-     * is therefore the entire merge story for this module. */
-    const ds4_json_value *hooks_v = ds4_config_get(cfg, "hooks");
-    if (!hooks_v) return NULL;
+/* Parses one {"PreToolUse": [...], "PostToolUse": [...]} object into tmp's
+ * event lists, appending (never resetting -- callers may invoke this
+ * multiple times to accumulate settings hooks then each plugin's). If
+ * plugin_dir is non-NULL, "./"-relative commands are resolved against it
+ * (see hk_resolve_command); plugin_name is used only to make warnings
+ * legible (NULL for the settings.json call site). Fully fail-open: any
+ * shape violation warns and skips just the offending entry/event, never the
+ * whole object. */
+static void hk_parse_hooks_obj(const ds4_json_value *hooks_v, ds4_hooks *tmp,
+                               const char *plugin_dir, const char *plugin_name,
+                               char *warn, size_t warn_len) {
+    char label[192];
     if (ds4_json_type_of(hooks_v) != DS4_JSON_OBJ) {
-        hk_warn_append(warn, warn_len, "hooks", "not an object, skipped");
-        return NULL;
+        if (plugin_name) snprintf(label, sizeof(label), "plugin %s: hooks.json", plugin_name);
+        else snprintf(label, sizeof(label), "hooks");
+        hk_warn_append(warn, warn_len, label, "not an object, skipped");
+        return;
     }
 
-    ds4_hooks tmp = {0};
     int n = ds4_json_obj_len(hooks_v);
     for (int i = 0; i < n; i++) {
         const char *key = ds4_json_obj_key_at(hooks_v, i);
         const ds4_json_value *val = ds4_json_obj_val_at(hooks_v, i);
+        if (plugin_name) snprintf(label, sizeof(label), "plugin %s: %s", plugin_name, key);
+        else snprintf(label, sizeof(label), "%s", key);
+
         ds4_hook_event ev;
         if (!hk_event_from_key(key, &ev)) {
-            hk_warn_append(warn, warn_len, key, "unknown hook event, skipped");
+            hk_warn_append(warn, warn_len, label, "unknown hook event, skipped");
             continue;
         }
         if (ds4_json_type_of(val) != DS4_JSON_ARR) {
-            hk_warn_append(warn, warn_len, key, "hook event value is not an array, skipped");
+            hk_warn_append(warn, warn_len, label, "hook event value is not an array, skipped");
             continue;
         }
         int m = ds4_json_arr_len(val);
         for (int j = 0; j < m; j++) {
             const ds4_json_value *entry = ds4_json_arr_get(val, j);
             if (ds4_json_type_of(entry) != DS4_JSON_OBJ) {
-                hk_warn_append(warn, warn_len, key, "hook entry is not an object, skipped");
+                hk_warn_append(warn, warn_len, label, "hook entry is not an object, skipped");
                 continue;
             }
             const char *command = ds4_json_str(ds4_json_obj_get(entry, "command"));
             if (!command || !command[0]) {
-                hk_warn_append(warn, warn_len, key, "hook entry missing command, skipped");
+                hk_warn_append(warn, warn_len, label, "hook entry missing command, skipped");
                 continue;
             }
             const char *matcher = ds4_json_str(ds4_json_obj_get(entry, "matcher"));
@@ -147,10 +183,100 @@ ds4_hooks *ds4_hooks_load(const ds4_config *cfg, char *warn, size_t warn_len) {
 
             hook_entry he;
             he.matcher = hk_strdup((matcher && matcher[0]) ? matcher : "*");
-            he.command = hk_strdup(command);
+            he.command = hk_resolve_command(command, plugin_dir);
             he.timeout_ms = (timeout_num > 0) ? (int)timeout_num : DS4_HOOKS_DEFAULT_TIMEOUT_MS;
-            hook_entry_push(&tmp.events[ev], he);
+            hook_entry_push(&tmp->events[ev], he);
         }
+    }
+}
+
+/* Reads <plugin_root>/hooks.json (missing file is not an error -- most
+ * plugins won't carry one) and appends its entries into tmp, resolving
+ * "./"-relative commands against plugin_root. Anything wrong with the file
+ * itself (too big, unreadable, malformed JSON, non-object root) is
+ * fail-open: warn + skip, never fatal, and never affects sibling plugins or
+ * the settings-derived hooks already parsed. A hooks.json with no "hooks"
+ * key is simply not a hooks bundle, silently. */
+static void hk_load_plugin_hooks(const char *plugin_root, const char *plugin_name,
+                                 ds4_hooks *tmp, char *warn, size_t warn_len) {
+    char *path = hk_join(plugin_root, "hooks.json");
+    if (!path) return;
+
+    struct stat st;
+    if (stat(path, &st) != 0) { free(path); return; } /* no hooks.json: not an error */
+    if (!S_ISREG(st.st_mode)) {
+        hk_warn_append(warn, warn_len, plugin_name, "hooks.json is not a regular file, skipped");
+        free(path);
+        return;
+    }
+    if (st.st_size < 0 || (size_t)st.st_size > DS4_HOOKS_MAX_FILE_SIZE) {
+        hk_warn_append(warn, warn_len, plugin_name, "hooks.json exceeds 1 MiB, skipped");
+        free(path);
+        return;
+    }
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        hk_warn_append(warn, warn_len, plugin_name, "could not open hooks.json, skipped");
+        free(path);
+        return;
+    }
+    size_t cap = (size_t)st.st_size + 1;
+    char *buf = malloc(cap);
+    if (!buf) {
+        fclose(fp);
+        hk_warn_append(warn, warn_len, plugin_name, "out of memory reading hooks.json, skipped");
+        free(path);
+        return;
+    }
+    size_t n = fread(buf, 1, (size_t)st.st_size, fp);
+    fclose(fp);
+    buf[n] = '\0';
+    free(path);
+
+    char jerr[128];
+    ds4_json_value *doc = ds4_json_parse(buf, jerr, sizeof(jerr));
+    free(buf);
+    if (!doc) {
+        hk_warn_append(warn, warn_len, plugin_name, jerr[0] ? jerr : "malformed hooks.json, skipped");
+        return;
+    }
+    if (ds4_json_type_of(doc) != DS4_JSON_OBJ) {
+        hk_warn_append(warn, warn_len, plugin_name, "hooks.json root is not an object, skipped");
+        ds4_json_free(doc);
+        return;
+    }
+    const ds4_json_value *hooks_v = ds4_json_obj_get(doc, "hooks");
+    if (hooks_v) hk_parse_hooks_obj(hooks_v, tmp, plugin_root, plugin_name, warn, warn_len);
+    ds4_json_free(doc);
+}
+
+ds4_hooks *ds4_hooks_load(const ds4_config *cfg, char *warn, size_t warn_len) {
+    if (warn && warn_len) warn[0] = '\0';
+    if (!cfg) return NULL;
+
+    ds4_hooks tmp = {0};
+
+    /* Task-2 config merge (ds4_config_get): a "hooks" key present in the
+     * project settings.json is used in full, in place of the user one --
+     * no deep merge across files, and no merge across the PreToolUse /
+     * PostToolUse arrays of two different files. Fetching the key once here
+     * is therefore the entire settings-side merge story for this module. */
+    const ds4_json_value *hooks_v = ds4_config_get(cfg, "hooks");
+    if (hooks_v) hk_parse_hooks_obj(hooks_v, &tmp, NULL, NULL, warn, warn_len);
+
+    /* Plugin hooks.json (see ds4_hooks.h): purely additive, never a
+     * settings.json-style override -- every plugin root contributes its
+     * entries AFTER the settings-derived ones, in root order (ds4_config's
+     * root order is itself deterministic: project base, project plugins
+     * sorted, user base, user plugins sorted). settings.json is never read
+     * from a plugin dir (see ds4_config.h), so plugins can only ever ADD
+     * hooks here, never replace or suppress the settings-derived policy. */
+    int nroots = ds4_config_root_count(cfg);
+    for (int i = 0; i < nroots; i++) {
+        if (!ds4_config_root_is_plugin(cfg, i)) continue;
+        const char *root = ds4_config_root_at(cfg, i);
+        const char *name = ds4_config_root_plugin_name(cfg, i);
+        if (root) hk_load_plugin_hooks(root, name, &tmp, warn, warn_len);
     }
 
     if (tmp.events[DS4_HOOK_PRE_TOOL].len == 0 && tmp.events[DS4_HOOK_POST_TOOL].len == 0) {
@@ -490,7 +616,6 @@ void ds4_hook_result_free(ds4_hook_result *r) {
 
 #include <dirent.h>
 #include <limits.h>
-#include <sys/stat.h>
 
 static int hooks_test_failures;
 
@@ -974,6 +1099,245 @@ static void test_malformed_entries_skipped(const char *allow_path) {
     hkt_teardown(fx, home, saved_home);
 }
 
+/* ---- plugin hooks.json tests ----
+ *
+ * These fixtures plant a project .ds4/plugins/<name>/ directly (hkt_setup
+ * only wires up settings.json), reusing the same hkt_* helpers as every
+ * other test group above. */
+
+static void test_plugin_hooks_run_after_settings(void) {
+    char tmpl[] = "/tmp/ds4_hooks_plugin_order.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    HOOKS_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+    fx = hk_strdup(fx);
+
+    char *log = hkt_join(fx, "log");
+    char *proj = hkt_join(fx, "proj");
+    char *proj_ds4 = hkt_join(proj, ".ds4");
+    hkt_mkdir_p(proj_ds4);
+
+    char settings[512];
+    snprintf(settings, sizeof(settings),
+             "{\"hooks\":{\"PreToolUse\":[{\"matcher\":\"*\",\"command\":\"echo settings >> %s\"}]}}",
+             log);
+    char *settings_path = hkt_join(proj_ds4, "settings.json");
+    hkt_write_file(settings_path, settings);
+
+    char *plugin_dir = hkt_join(proj_ds4, "plugins/myplugin");
+    hkt_mkdir_p(plugin_dir);
+    char plugin_hooks[512];
+    snprintf(plugin_hooks, sizeof(plugin_hooks),
+             "{\"hooks\":{\"PreToolUse\":[{\"matcher\":\"*\",\"command\":\"echo plugin >> %s\"}]}}",
+             log);
+    char *plugin_hooks_path = hkt_join(plugin_dir, "hooks.json");
+    hkt_write_file(plugin_hooks_path, plugin_hooks);
+
+    char *home = hkt_join(fx, "home");
+    hkt_mkdir_p(home);
+    char *saved_home;
+    hkt_setenv_home(home, &saved_home);
+
+    ds4_config *cfg = ds4_config_load(proj, NULL, 0);
+    HOOKS_TEST_ASSERT(cfg != NULL);
+    if (cfg) {
+        char warn[256] = {0};
+        ds4_hooks *h = ds4_hooks_load(cfg, warn, sizeof(warn));
+        HOOKS_TEST_ASSERT(h != NULL);
+        if (h) {
+            HOOKS_TEST_ASSERT(ds4_hooks_count(h, DS4_HOOK_PRE_TOOL) == 2);
+            ds4_hook_result r = ds4_hooks_run(h, DS4_HOOK_PRE_TOOL, "bash", "{}");
+            HOOKS_TEST_ASSERT(!r.blocked);
+            ds4_hook_result_free(&r);
+            ds4_hooks_free(h);
+        }
+    }
+    ds4_config_free(cfg);
+
+    FILE *fp = fopen(log, "rb");
+    HOOKS_TEST_ASSERT(fp != NULL);
+    if (fp) {
+        char buf[256] = {0};
+        size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+        buf[n] = '\0';
+        fclose(fp);
+        /* settings.json hooks must run before plugin hooks, regardless of
+         * which one's file happened to be written to disk first. */
+        HOOKS_TEST_ASSERT(strcmp(buf, "settings\nplugin\n") == 0);
+    }
+
+    hkt_restore_home(saved_home);
+    free(home);
+    free(proj); free(proj_ds4); free(settings_path);
+    free(plugin_dir); free(plugin_hooks_path); free(log);
+    hkt_rmtree(fx);
+    free(fx);
+}
+
+static void test_plugin_hooks_relative_command_resolves_to_plugin_dir(void) {
+    char tmpl[] = "/tmp/ds4_hooks_plugin_relcmd.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    HOOKS_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+    fx = hk_strdup(fx);
+
+    char *proj = hkt_join(fx, "proj");
+    char *proj_ds4 = hkt_join(proj, ".ds4");
+    hkt_mkdir_p(proj_ds4);
+
+    char *plugin_dir = hkt_join(proj_ds4, "plugins/relplugin");
+    hkt_mkdir_p(plugin_dir);
+
+    /* The hook script lives inside the plugin dir; its hooks.json refers to
+     * it with a "./"-relative command, which must resolve against the
+     * plugin dir -- not ds4-agent's cwd (the project root here) -- or
+     * /bin/sh would fail to find it (exit 127, not the exit-2 this asserts
+     * on). */
+    char *script_path = hkt_join(plugin_dir, "tag.sh");
+    hkt_write_file(script_path, "#!/bin/sh\necho relplugin-tag 1>&2\nexit 2\n");
+    chmod(script_path, 0755);
+
+    char *plugin_hooks_path = hkt_join(plugin_dir, "hooks.json");
+    hkt_write_file(plugin_hooks_path,
+        "{\"hooks\":{\"PreToolUse\":[{\"matcher\":\"*\",\"command\":\"./tag.sh\"}]}}");
+
+    char *home = hkt_join(fx, "home");
+    hkt_mkdir_p(home);
+    char *saved_home;
+    hkt_setenv_home(home, &saved_home);
+
+    ds4_config *cfg = ds4_config_load(proj, NULL, 0);
+    HOOKS_TEST_ASSERT(cfg != NULL);
+    if (cfg) {
+        char warn[256] = {0};
+        ds4_hooks *h = ds4_hooks_load(cfg, warn, sizeof(warn));
+        HOOKS_TEST_ASSERT(h != NULL);
+        if (h) {
+            HOOKS_TEST_ASSERT(ds4_hooks_count(h, DS4_HOOK_PRE_TOOL) == 1);
+            ds4_hook_result r = ds4_hooks_run(h, DS4_HOOK_PRE_TOOL, "bash", "{}");
+            HOOKS_TEST_ASSERT(r.blocked);
+            HOOKS_TEST_ASSERT(r.block_reason != NULL &&
+                              strstr(r.block_reason, "relplugin-tag") != NULL);
+            ds4_hook_result_free(&r);
+            ds4_hooks_free(h);
+        }
+    }
+    ds4_config_free(cfg);
+
+    hkt_restore_home(saved_home);
+    free(home);
+    free(proj); free(proj_ds4); free(plugin_dir);
+    free(script_path); free(plugin_hooks_path);
+    hkt_rmtree(fx);
+    free(fx);
+}
+
+static void test_plugin_hooks_malformed_warns_siblings_fine(void) {
+    char tmpl[] = "/tmp/ds4_hooks_plugin_malformed.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    HOOKS_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+    fx = hk_strdup(fx);
+
+    char *proj = hkt_join(fx, "proj");
+    char *proj_ds4 = hkt_join(proj, ".ds4");
+    hkt_mkdir_p(proj_ds4);
+
+    char *bad_plugin = hkt_join(proj_ds4, "plugins/bad");
+    hkt_mkdir_p(bad_plugin);
+    char *bad_hooks_path = hkt_join(bad_plugin, "hooks.json");
+    hkt_write_file(bad_hooks_path, "{ not json");
+
+    char *log = hkt_join(fx, "log");
+    char *good_plugin = hkt_join(proj_ds4, "plugins/good");
+    hkt_mkdir_p(good_plugin);
+    char good_hooks[512];
+    snprintf(good_hooks, sizeof(good_hooks),
+             "{\"hooks\":{\"PreToolUse\":[{\"matcher\":\"*\",\"command\":\"echo good >> %s\"}]}}",
+             log);
+    char *good_hooks_path = hkt_join(good_plugin, "hooks.json");
+    hkt_write_file(good_hooks_path, good_hooks);
+
+    char *home = hkt_join(fx, "home");
+    hkt_mkdir_p(home);
+    char *saved_home;
+    hkt_setenv_home(home, &saved_home);
+
+    ds4_config *cfg = ds4_config_load(proj, NULL, 0);
+    HOOKS_TEST_ASSERT(cfg != NULL);
+    if (cfg) {
+        char warn[512] = {0};
+        ds4_hooks *h = ds4_hooks_load(cfg, warn, sizeof(warn));
+        HOOKS_TEST_ASSERT(warn[0] != '\0');
+        HOOKS_TEST_ASSERT(h != NULL);
+        if (h) {
+            HOOKS_TEST_ASSERT(ds4_hooks_count(h, DS4_HOOK_PRE_TOOL) == 1);
+            ds4_hook_result r = ds4_hooks_run(h, DS4_HOOK_PRE_TOOL, "bash", "{}");
+            HOOKS_TEST_ASSERT(!r.blocked);
+            ds4_hook_result_free(&r);
+            ds4_hooks_free(h);
+        }
+    }
+    ds4_config_free(cfg);
+
+    FILE *fp = fopen(log, "rb");
+    HOOKS_TEST_ASSERT(fp != NULL);
+    if (fp) {
+        char buf[64] = {0};
+        size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+        buf[n] = '\0';
+        fclose(fp);
+        HOOKS_TEST_ASSERT(strcmp(buf, "good\n") == 0);
+    }
+
+    hkt_restore_home(saved_home);
+    free(home);
+    free(proj); free(proj_ds4);
+    free(bad_plugin); free(bad_hooks_path);
+    free(good_plugin); free(good_hooks_path); free(log);
+    hkt_rmtree(fx);
+    free(fx);
+}
+
+static void test_plugin_settings_json_ignored(void) {
+    char tmpl[] = "/tmp/ds4_hooks_plugin_settings.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    HOOKS_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+    fx = hk_strdup(fx);
+
+    char *proj = hkt_join(fx, "proj");
+    char *proj_ds4 = hkt_join(proj, ".ds4");
+    hkt_mkdir_p(proj_ds4);
+
+    char *plugin_dir = hkt_join(proj_ds4, "plugins/sneaky");
+    hkt_mkdir_p(plugin_dir);
+    /* A plugin cannot carry settings.json (see ds4_config.h): permissions
+     * and the settings-derived hook policy stay user-controlled. Plant one
+     * that -- if it were read -- would be observable via ds4_config_get,
+     * and assert it is not. */
+    char *plugin_settings_path = hkt_join(plugin_dir, "settings.json");
+    hkt_write_file(plugin_settings_path, "{\"marker_from_plugin\":true}");
+
+    char *home = hkt_join(fx, "home");
+    hkt_mkdir_p(home);
+    char *saved_home;
+    hkt_setenv_home(home, &saved_home);
+
+    ds4_config *cfg = ds4_config_load(proj, NULL, 0);
+    HOOKS_TEST_ASSERT(cfg != NULL);
+    if (cfg) {
+        HOOKS_TEST_ASSERT(ds4_config_get(cfg, "marker_from_plugin") == NULL);
+    }
+    ds4_config_free(cfg);
+
+    hkt_restore_home(saved_home);
+    free(home);
+    free(proj); free(proj_ds4); free(plugin_dir); free(plugin_settings_path);
+    hkt_rmtree(fx);
+    free(fx);
+}
+
 int ds4_hooks_unit_tests_run(void) {
     char *allow = hkt_resolve_fixture("tests/fixtures/hook_allow.sh");
     char *block = hkt_resolve_fixture("tests/fixtures/hook_block.sh");
@@ -994,6 +1358,11 @@ int ds4_hooks_unit_tests_run(void) {
         test_wholesale_override(allow, block);
         test_malformed_entries_skipped(allow);
     }
+
+    test_plugin_hooks_run_after_settings();
+    test_plugin_hooks_relative_command_resolves_to_plugin_dir();
+    test_plugin_hooks_malformed_warns_siblings_fine();
+    test_plugin_settings_json_ignored();
 
     free(allow); free(block); free(broken); free(stdin_fx); free(slow);
     return hooks_test_failures;

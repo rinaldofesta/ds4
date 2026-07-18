@@ -1540,6 +1540,48 @@ static void test_registry_free_reaps(void) {
     mcp_test_teardown(fx, home, saved_home);
 }
 
+/* mcp.json inside a plugin root is just another root's file to
+ * mcp_load_all -- zero code changes needed here (mirrors the plugin tests in
+ * ds4_skills.c/ds4_commands.c). One happy-path check: the mock spawns and
+ * its tools are discovered exactly as when mcp.json lives in a base root. */
+static void test_plugin_mcp_json_spawns_mock(void) {
+    char tmpl[] = "/tmp/ds4_mcp_plugin_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    MCP_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+    fx = mcp_test_strdup(fx);
+
+    char *proj = mcp_test_join(fx, "proj");
+    char *proj_ds4 = mcp_test_join(proj, ".ds4");
+    mcp_test_mkdir_p(proj_ds4);
+    char *plugin_dir = mcp_test_join(proj_ds4, "plugins/myplugin");
+    mcp_test_mkdir_p(plugin_dir);
+    mcp_test_write_mcpjson(plugin_dir, "normal");
+
+    char *home = mcp_test_join(fx, "home");
+    mcp_test_mkdir_p(home);
+    char *saved_home;
+    mcp_test_setenv_home(home, &saved_home);
+
+    ds4_config *cfg = ds4_config_load(proj, NULL, 0);
+    MCP_TEST_ASSERT(cfg != NULL);
+    if (cfg) {
+        char warn[512] = {0};
+        ds4_mcp_registry *reg = ds4_mcp_registry_create(cfg, NULL, warn, sizeof(warn));
+        MCP_TEST_ASSERT(reg != NULL);
+        if (reg) {
+            MCP_TEST_ASSERT(ds4_mcp_registry_tool_count(reg) == 2);
+            const ds4_mcp_tool *echo = ds4_mcp_registry_find(reg, "mcp__mock__echo");
+            MCP_TEST_ASSERT(echo != NULL);
+        }
+        ds4_mcp_registry_free(reg);
+    }
+    ds4_config_free(cfg);
+
+    mcp_test_teardown(fx, home, saved_home);
+    free(proj); free(proj_ds4); free(plugin_dir);
+}
+
 int ds4_mcp_unit_tests_run(void) {
     test_normal();
     test_args_to_json();
@@ -1553,6 +1595,7 @@ int ds4_mcp_unit_tests_run(void) {
     test_no_config();
     test_golden_prompt();
     test_registry_free_reaps();
+    test_plugin_mcp_json_spawns_mock();
     return mcp_test_failures;
 }
 #endif

@@ -515,12 +515,74 @@ static void test_expand_unknown_and_deleted(void) {
     ds4_commands_list_free(&list);
 }
 
+/* Plugin roots are just more search roots to ds4_commands_scan -- zero code
+ * changes needed here (mirrors test_plugin_skill_discovered_and_shadowed in
+ * ds4_skills.c). */
+static void test_plugin_command_discovered_and_shadowed(void) {
+    char tmpl[] = "/tmp/ds4_commands_plugin_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    DC_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    char *proj = dc_test_join(fx, "proj");
+    char *proj_ds4 = dc_test_join(proj, ".ds4");
+    char *proj_cmds = dc_test_join(proj_ds4, "commands");
+    dc_test_mkdir_p(proj_cmds);
+    char *proj_shared = dc_test_join(proj_cmds, "shared.md");
+    dc_test_write_file(proj_shared, "Base project shared body.\n");
+
+    char *plugin_cmds = dc_test_join(proj_ds4, "plugins/myplugin/commands");
+    dc_test_mkdir_p(plugin_cmds);
+    char *plugin_shared = dc_test_join(plugin_cmds, "shared.md");
+    dc_test_write_file(plugin_shared, "Plugin shared body.\n");
+    char *plugin_only = dc_test_join(plugin_cmds, "pluginonly.md");
+    dc_test_write_file(plugin_only, "Plugin-only body.\n");
+
+    char *home = dc_test_join(fx, "home");
+    dc_test_mkdir_p(home);
+    char *saved_home;
+    dc_test_setenv_home(home, &saved_home);
+
+    ds4_config *cfg = ds4_config_load(proj, NULL, 0);
+    DC_TEST_ASSERT(cfg != NULL);
+    if (cfg) {
+        char warn[512] = {0};
+        ds4_command_list list = {0};
+        ds4_commands_scan(cfg, &list, warn, sizeof(warn));
+
+        DC_TEST_ASSERT(ds4_commands_known(&list, "/pluginonly"));
+        DC_TEST_ASSERT(ds4_commands_known(&list, "/shared"));
+
+        /* base-root command shadows the plugin's same-name command */
+        char *expanded_shared = ds4_commands_expand(&list, "/shared", NULL);
+        DC_TEST_ASSERT(expanded_shared != NULL);
+        if (expanded_shared) {
+            DC_TEST_ASSERT(strcmp(expanded_shared, "Base project shared body.\n") == 0);
+            free(expanded_shared);
+        }
+        char *expanded_only = ds4_commands_expand(&list, "/pluginonly", NULL);
+        DC_TEST_ASSERT(expanded_only != NULL);
+        if (expanded_only) {
+            DC_TEST_ASSERT(strcmp(expanded_only, "Plugin-only body.\n") == 0);
+            free(expanded_only);
+        }
+        ds4_commands_list_free(&list);
+    }
+    ds4_config_free(cfg);
+
+    dc_test_restore_home(saved_home);
+    free(proj); free(proj_ds4); free(proj_cmds); free(proj_shared);
+    free(plugin_cmds); free(plugin_shared); free(plugin_only); free(home);
+    dc_test_rmtree(fx);
+}
+
 int ds4_commands_unit_tests_run(void) {
     test_scan_project_user_collision();
     test_scan_invalid_names();
     test_known_matching();
     test_expand_arguments();
     test_expand_unknown_and_deleted();
+    test_plugin_command_discovered_and_shadowed();
     return dc_test_failures;
 }
 #endif

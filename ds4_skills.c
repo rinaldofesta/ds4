@@ -963,6 +963,73 @@ static void test_find_load_unknown(void) {
     SK_TEST_ASSERT(ds4_skills_find(NULL, "nope") == NULL);
 }
 
+/* Plugin roots (ds4_config's .ds4/plugins/<name>) are just more search
+ * roots to ds4_skills_scan -- zero code changes needed here, this only
+ * proves the existing scan/shadowing logic already extends correctly once
+ * ds4_config_root_count/root_at include plugin roots. */
+static void test_plugin_skill_discovered_and_shadowed(void) {
+    char tmpl[] = "/tmp/ds4_skills_plugin_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    SK_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    char *proj = sk_test_join(fx, "proj");
+    char *proj_ds4 = sk_test_join(proj, ".ds4");
+
+    /* plugin-only skill: discovered purely via the plugin root */
+    char *plugin_skill = sk_test_join(proj_ds4, "plugins/myplugin/skills/pluginskill");
+    sk_test_mkdir_p(plugin_skill);
+    char *plugin_md = sk_test_join(plugin_skill, "SKILL.md");
+    sk_test_write_file(plugin_md,
+        "---\nname: pluginskill\ndescription: From the plugin.\n---\nPlugin body.\n");
+
+    /* same frontmatter name in the project base root and in a project
+     * plugin: the base root must shadow the plugin (project .ds4 precedes
+     * project .ds4/plugins/<name> in root order). */
+    char *base_skill = sk_test_join(proj_ds4, "skills/shared-copy");
+    sk_test_mkdir_p(base_skill);
+    char *base_md = sk_test_join(base_skill, "SKILL.md");
+    sk_test_write_file(base_md,
+        "---\nname: shared\ndescription: Base project version.\n---\nBase body.\n");
+
+    char *plugin_shared = sk_test_join(proj_ds4, "plugins/myplugin/skills/shared-copy");
+    sk_test_mkdir_p(plugin_shared);
+    char *plugin_shared_md = sk_test_join(plugin_shared, "SKILL.md");
+    sk_test_write_file(plugin_shared_md,
+        "---\nname: shared\ndescription: Plugin version.\n---\nPlugin shared body.\n");
+
+    char *home = sk_test_join(fx, "home");
+    sk_test_mkdir_p(home);
+    char *saved_home;
+    sk_test_setenv_home(home, &saved_home);
+
+    ds4_config *cfg = ds4_config_load(proj, NULL, 0);
+    SK_TEST_ASSERT(cfg != NULL);
+    if (cfg) {
+        SK_TEST_ASSERT(ds4_config_root_count(cfg) == 3); /* project base + 1 project plugin + user base */
+        char warn[512] = {0};
+        ds4_skill_list list = {0};
+        ds4_skills_scan(cfg, &list, warn, sizeof(warn));
+
+        const ds4_skill_meta *plugin_only = ds4_skills_find(&list, "pluginskill");
+        SK_TEST_ASSERT(plugin_only != NULL);
+        if (plugin_only) SK_TEST_ASSERT(strcmp(plugin_only->description, "From the plugin.") == 0);
+
+        const ds4_skill_meta *shared = ds4_skills_find(&list, "shared");
+        SK_TEST_ASSERT(shared != NULL);
+        if (shared) SK_TEST_ASSERT(strcmp(shared->description, "Base project version.") == 0);
+
+        ds4_skills_list_free(&list);
+    }
+    ds4_config_free(cfg);
+
+    sk_test_restore_home(saved_home);
+    free(proj); free(proj_ds4); free(plugin_skill); free(plugin_md);
+    free(base_skill); free(base_md); free(plugin_shared); free(plugin_shared_md);
+    free(home);
+    sk_test_rmtree(fx);
+}
+
 int ds4_skills_unit_tests_run(void) {
     test_valid_skill_discovered();
     test_shadowing();
@@ -972,6 +1039,7 @@ int ds4_skills_unit_tests_run(void) {
     test_find_load_unknown();
     test_sort_within_root_segment();
     test_same_root_duplicate_name_warns();
+    test_plugin_skill_discovered_and_shadowed();
     return sk_test_failures;
 }
 #endif

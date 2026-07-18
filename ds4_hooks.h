@@ -32,6 +32,28 @@
  * entries (missing command, a non-array event value, unknown event keys)
  * are skipped with a warning; never fatal.
  *
+ * Plugin hooks (see ds4_config.h for what a plugin is): every plugin root
+ * (ds4_config_root_is_plugin) may additionally carry its own
+ * <plugin-root>/hooks.json, shaped exactly like settings.json's "hooks"
+ * value: {"hooks": {"PreToolUse": [...], "PostToolUse": [...]}}. Unlike
+ * settings.json's whole-key-replace merge, plugin hooks are purely additive:
+ * they run AFTER the settings-derived hooks, in root order, and can never
+ * replace or suppress them -- a plugin only ever adds lifecycle behavior, it
+ * cannot alter permissions or override the settings-derived hook policy
+ * (settings.json itself is never read from a plugin dir; see
+ * ds4_config_root_count/root_at). A "command" that starts with "./" is
+ * resolved against THAT PLUGIN's own directory (the leading "./" is dropped
+ * and the plugin dir is prefixed instead), so a plugin bundle stays
+ * relocatable regardless of ds4-agent's cwd or the project root; settings.json
+ * hooks are unaffected (they already run with cwd = project root). A
+ * malformed plugin hooks.json is fail-open: skip + warn, siblings (other
+ * plugins, or the settings hooks) unaffected.
+ *
+ * Trust note: a project's .ds4/ (including its plugins/) is trusted the same
+ * way project settings.json hooks already are -- running ds4-agent in a
+ * cloned repo executes that repo's configured hooks, plugin hooks included.
+ * Same model, no new exposure class.
+ *
  * Payload shapes written to each hook's stdin (built by the caller):
  *   {"event":"PreToolUse","tool_name":"bash","tool_input":{"command":"make test"}}
  *   {"event":"PostToolUse","tool_name":"bash","tool_input":{...},"tool_output":"<first 8 KiB of result>"}
