@@ -5,6 +5,7 @@
 #include "ds4_web.h"
 #include "ds4_json.h"
 #include "ds4_config.h"
+#include "ds4_skills.h"
 #include "linenoise.h"
 
 #include <errno.h>
@@ -103,6 +104,8 @@ typedef struct {
     ds4_session *session;
     ds4_tokens transcript;
     char *cache_dir;
+    ds4_config *config;
+    ds4_skill_list skills;
     char *sysprompt_path;
     char session_sha[41];
     char *session_title;
@@ -969,17 +972,40 @@ static const char agent_dsml_syntax_reminder[] =
 
 #define AGENT_SYSTEM_PROMPT_REMINDER_TOKENS 50000
 
-static char *agent_build_system_prompt_reminder(void) {
+/* Names-only (no descriptions) reminder of the currently discovered skills;
+ * kept separate from agent_build_tools_prompt() so the built-in tool prompt
+ * text stays exactly what it was before skills existed. */
+static char *agent_build_skills_reminder_line(agent_worker *w) {
+    if (w->skills.len == 0) return NULL;
+    size_t cap = 32;
+    for (int i = 0; i < w->skills.len; i++)
+        cap += strlen(w->skills.v[i].name) + 2;
+    char *line = xmalloc(cap);
+    line[0] = '\0';
+    strcat(line, "Available skills: ");
+    for (int i = 0; i < w->skills.len; i++) {
+        if (i) strcat(line, ", ");
+        strcat(line, w->skills.v[i].name);
+    }
+    strcat(line, "\n");
+    return line;
+}
+
+static char *agent_build_system_prompt_reminder(agent_worker *w) {
     char *tools = agent_build_tools_prompt();
+    char *skills_line = agent_build_skills_reminder_line(w);
     const char *start = "\n\n[System prompt reminder follows.]\n";
     const char *end = "[End system prompt reminder.]\n\n";
-    size_t len = strlen(start) + strlen(tools) + strlen(end) + 1;
+    size_t len = strlen(start) + strlen(tools) +
+                 (skills_line ? strlen(skills_line) : 0) + strlen(end) + 1;
     char *out = xmalloc(len);
     out[0] = '\0';
     strcat(out, start);
     strcat(out, tools);
+    if (skills_line) strcat(out, skills_line);
     strcat(out, end);
     free(tools);
+    free(skills_line);
     return out;
 }
 
@@ -1042,7 +1068,7 @@ static void agent_worker_maybe_append_system_prompt_reminder(agent_worker *w) {
         return;
     }
 
-    char *reminder = agent_build_system_prompt_reminder();
+    char *reminder = agent_build_system_prompt_reminder(w);
     agent_publish_system_status(w, "Re-injecting system prompt reminder...");
     agent_trace(w, "system prompt reminder injected at transcript=%d",
                 w->transcript.len);
@@ -3990,12 +4016,26 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
     return ok;
 }
 
+/* Appended after the fixed system prompt: dynamic, worker-specific context
+ * that varies with what was discovered at startup (skills today; MCP tool
+ * schemas and project memory in later tasks). Single-purpose for now: with
+ * no skills discovered, ds4_skills_catalog_prompt_text returns NULL and this
+ * appends zero tokens, so the rendered prompt is unchanged. */
+static void agent_append_dynamic_context(agent_worker *w, ds4_tokens *out) {
+    char *skills_prompt = ds4_skills_catalog_prompt_text(&w->skills);
+    if (skills_prompt) {
+        ds4_tokenize_rendered_chat(w->engine, skills_prompt, out);
+        free(skills_prompt);
+    }
+}
+
 static void agent_worker_build_system_tokens(agent_worker *w, ds4_tokens *out) {
     ds4_chat_begin(w->engine, out);
     if (w->cfg->gen.think_mode == DS4_THINK_MAX &&
         effective_think_mode(w->cfg) == DS4_THINK_MAX)
         ds4_chat_append_max_effort_prefix(w->engine, out);
     agent_append_system_prompt(w->engine, out, w->cfg->gen.system);
+    agent_append_dynamic_context(w, out);
 }
 
 static void agent_publish_system_status(agent_worker *w, const char *msg) {
@@ -6196,9 +6236,70 @@ static void test_agent_edit_upto_requires_tail_after_newline_strip(void) {
     AGENT_TEST_ASSERT(strstr(err, "must include a unique tail anchor") != NULL);
 }
 
+/* Forward declared: defined later in the file (tool dispatch), needed here so
+ * this test can drive a "skill" call through the real dispatch chain. */
+static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *call);
+
+static void test_agent_tool_skill_dispatch(void) {
+    char tmpl[] = "/tmp/ds4_agent_skill_dispatch_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    AGENT_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    char md_path[PATH_MAX];
+    snprintf(md_path, sizeof(md_path), "%s/SKILL.md", fx);
+    FILE *fp = fopen(md_path, "wb");
+    AGENT_TEST_ASSERT(fp != NULL);
+    if (fp) {
+        fputs("---\nname: the-skill\ndescription: Test skill.\n---\nDo the thing.\n", fp);
+        fclose(fp);
+    }
+
+    /* A bare, mostly-zeroed worker with only .skills populated: agent_tool_skill
+     * must not touch anything else on w (see the comment on its definition). */
+    agent_worker w = {0};
+    w.skills.v = xmalloc(sizeof(ds4_skill_meta));
+    w.skills.len = 1;
+    w.skills.cap = 1;
+    w.skills.v[0].name = xstrdup("the-skill");
+    w.skills.v[0].description = xstrdup("Test skill.");
+    w.skills.v[0].dir = xstrdup(fx);
+
+    agent_tool_call call = {0};
+    call.name = xstrdup("skill");
+    agent_tool_call_add_arg(&call, "name", "the-skill", strlen("the-skill"), true);
+    char *result = agent_execute_tool_call(&w, &call);
+    AGENT_TEST_ASSERT(result != NULL);
+    if (result) AGENT_TEST_ASSERT(strstr(result, "Do the thing.") != NULL);
+    free(result);
+    agent_tool_call_free(&call);
+
+    agent_tool_call call_unknown = {0};
+    call_unknown.name = xstrdup("skill");
+    agent_tool_call_add_arg(&call_unknown, "name", "nope", strlen("nope"), true);
+    char *result_unknown = agent_execute_tool_call(&w, &call_unknown);
+    AGENT_TEST_ASSERT(result_unknown != NULL);
+    if (result_unknown) AGENT_TEST_ASSERT(strstr(result_unknown, "Tool error: unknown skill") != NULL);
+    free(result_unknown);
+    agent_tool_call_free(&call_unknown);
+
+    agent_tool_call call_missing = {0};
+    call_missing.name = xstrdup("skill");
+    char *result_missing = agent_execute_tool_call(&w, &call_missing);
+    AGENT_TEST_ASSERT(result_missing != NULL);
+    if (result_missing) AGENT_TEST_ASSERT(strstr(result_missing, "Tool error") != NULL);
+    free(result_missing);
+    agent_tool_call_free(&call_missing);
+
+    ds4_skills_list_free(&w.skills);
+    unlink(md_path);
+    rmdir(fx);
+}
+
 static void ds4_agent_unit_tests_run(void) {
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
+    test_agent_tool_skill_dispatch();
 }
 #endif
 
@@ -6628,6 +6729,42 @@ static char *agent_tool_visit_page(agent_worker *w, const agent_tool_call *call)
     }
     free(head);
     free(md);
+    return agent_buf_take(&out);
+}
+
+/* Loads a discovered skill's full body on demand. Lookup + a single file read
+ * only -- no publish/engine calls -- so it is safe to exercise with a bare
+ * agent_worker that has only .skills populated (see test_agent_tool_skill_dispatch). */
+static char *agent_tool_skill(agent_worker *w, const agent_tool_call *call) {
+    const char *name = agent_tool_arg_value(call, "name");
+    if (!name || !name[0]) return xstrdup("Tool error: skill requires name\n");
+
+    const ds4_skill_meta *meta = ds4_skills_find(&w->skills, name);
+    if (!meta) {
+        agent_buf b = {0};
+        agent_buf_puts(&b, "Tool error: unknown skill: ");
+        agent_buf_puts(&b, name);
+        agent_buf_puts(&b, "\n");
+        return agent_buf_take(&b);
+    }
+
+    char *body = ds4_skills_load_body(&w->skills, name);
+    if (!body) {
+        agent_buf b = {0};
+        agent_buf_puts(&b, "Tool error: could not load skill: ");
+        agent_buf_puts(&b, name);
+        agent_buf_puts(&b, "\n");
+        return agent_buf_take(&b);
+    }
+
+    agent_buf out = {0};
+    agent_buf_puts(&out, "Skill '");
+    agent_buf_puts(&out, meta->name);
+    agent_buf_puts(&out, "' (");
+    agent_buf_puts(&out, meta->dir);
+    agent_buf_puts(&out, "/SKILL.md):\n\n");
+    agent_buf_puts(&out, body);
+    free(body);
     return agent_buf_take(&out);
 }
 
@@ -7154,6 +7291,7 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     if (!strcmp(call->name, "search")) return agent_tool_search(w, call);
     if (!strcmp(call->name, "google_search")) return agent_tool_google_search(w, call);
     if (!strcmp(call->name, "visit_page")) return agent_tool_visit_page(w, call);
+    if (!strcmp(call->name, "skill")) return agent_tool_skill(w, call);
 
     if (!strcmp(call->name, "bash")) {
         const char *cmd = agent_tool_arg_value(call, "command");
@@ -9443,6 +9581,22 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
                 w->cache_dir, strerror(errno));
         return -1;
     }
+    /* Loaded after any --chdir has already taken effect (main() chdirs
+     * before calling into run_agent/run_agent_non_interactive), so project
+     * .ds4 discovery walks up from the intended working directory. */
+    char cfg_warn[512] = {0};
+    w->config = ds4_config_load(NULL, cfg_warn, sizeof(cfg_warn));
+    char skills_warn[512] = {0};
+    ds4_skills_scan(w->config, &w->skills, skills_warn, sizeof(skills_warn));
+    if (cfg_warn[0] || skills_warn[0]) {
+        if (cfg->non_interactive) {
+            if (cfg_warn[0]) fputs(cfg_warn, stderr);
+            if (skills_warn[0]) fputs(skills_warn, stderr);
+        } else {
+            if (cfg_warn[0]) agent_publishf_system_status(w, "%s", cfg_warn);
+            if (skills_warn[0]) agent_publishf_system_status(w, "%s", skills_warn);
+        }
+    }
     ds4_web_config web_cfg = {
         .home_dir = getenv("HOME"),
         .port = 9333,
@@ -9476,6 +9630,8 @@ static void agent_worker_free(agent_worker *w) {
     ds4_web_free(w->web);
     ds4_session_free(w->session);
     ds4_tokens_free(&w->transcript);
+    ds4_skills_list_free(&w->skills);
+    ds4_config_free(w->config);
     free(w->cache_dir);
     free(w->sysprompt_path);
     free(w->session_title);
