@@ -3,6 +3,8 @@
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
 #include "ds4_web.h"
+#include "ds4_json.h"
+#include "ds4_config.h"
 #include "linenoise.h"
 
 #include <errno.h>
