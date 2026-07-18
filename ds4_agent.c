@@ -3755,6 +3755,118 @@ static char *agent_kv_path_for_sha(const char *dir, const char sha[41]) {
     return ds4_kvstore_path_join(dir, name);
 }
 
+/* Content-addressed sysprompt cache naming: distinct rendered prompts (now
+ * per-project, since skills/MCP/memory are folded into the system prompt)
+ * get distinct, stable cache files instead of stomping one fixed name on
+ * every project switch. The name shape is fixed at 16 lowercase hex chars so
+ * it never collides with the 40-hex + ".kv" shape ds4_kvstore_sha_hex_name()
+ * reserves for session files. */
+#define AGENT_SYSPROMPT_CACHE_PREFIX "sysprompt-"
+#define AGENT_SYSPROMPT_CACHE_HEX_LEN 16
+#define AGENT_SYSPROMPT_CACHE_NAME_LEN \
+    (sizeof(AGENT_SYSPROMPT_CACHE_PREFIX) - 1 + AGENT_SYSPROMPT_CACHE_HEX_LEN + 3)
+
+/* Pure function of (cache_dir, text, text_len): derive
+ * <cache_dir>/sysprompt-<first 16 hex of sha1(text)>.kv. */
+static void agent_sysprompt_cache_path(const char *cache_dir, const char *text,
+                                       size_t text_len, char *out, size_t out_len) {
+    char sha[41];
+    ds4_kvstore_sha1_bytes_hex(text ? text : "", text_len, sha);
+    char name[AGENT_SYSPROMPT_CACHE_NAME_LEN + 1];
+    snprintf(name, sizeof(name), "%s%.*s.kv", AGENT_SYSPROMPT_CACHE_PREFIX,
+             AGENT_SYSPROMPT_CACHE_HEX_LEN, sha);
+    char *path = ds4_kvstore_path_join(cache_dir, name);
+    snprintf(out, out_len, "%s", path ? path : "");
+    free(path);
+}
+
+/* Strict shape check for GC: exactly "sysprompt-" + 16 lowercase hex +
+ * ".kv", nothing looser. Anything else -- session files, malformed suffixes,
+ * unrelated files -- must be left untouched by the GC below. */
+static bool agent_sysprompt_cache_name_matches(const char *name) {
+    size_t prefix_len = sizeof(AGENT_SYSPROMPT_CACHE_PREFIX) - 1;
+    if (strlen(name) != AGENT_SYSPROMPT_CACHE_NAME_LEN) return false;
+    if (strncmp(name, AGENT_SYSPROMPT_CACHE_PREFIX, prefix_len) != 0) return false;
+    for (size_t i = 0; i < AGENT_SYSPROMPT_CACHE_HEX_LEN; i++) {
+        char c = name[prefix_len + i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    }
+    return strcmp(name + prefix_len + AGENT_SYSPROMPT_CACHE_HEX_LEN, ".kv") == 0;
+}
+
+typedef struct {
+    char *path;
+    time_t mtime;
+} agent_sysprompt_cache_file;
+
+static int agent_sysprompt_cache_file_cmp_recent(const void *a, const void *b) {
+    const agent_sysprompt_cache_file *fa = a, *fb = b;
+    if (fa->mtime != fb->mtime) return fa->mtime > fb->mtime ? -1 : 1;
+    return strcmp(fa->path, fb->path);
+}
+
+#define AGENT_SYSPROMPT_CACHE_KEEP 8
+
+/* Best-effort GC for the content-addressed sysprompt cache. Keeps keep_path
+ * (if it exists on disk) plus the (AGENT_SYSPROMPT_CACHE_KEEP - 1) most
+ * recently modified other sysprompt-<hex16>.kv files -- AGENT_SYSPROMPT_CACHE_KEEP
+ * total -- and unlinks the rest. The legacy fixed sysprompt.kv name, if
+ * present, is always eligible for deletion. Files that don't match the strict
+ * shape (session .kv files, malformed names) are never touched. Unlink
+ * failures are ignored: this is cleanup, not correctness. */
+static void agent_sysprompt_cache_gc(const char *cache_dir, const char *keep_path) {
+    DIR *d = opendir(cache_dir);
+    if (!d) return;
+
+    agent_sysprompt_cache_file *files = NULL;
+    int len = 0, cap = 0;
+    char *legacy_path = NULL;
+    bool keep_path_present = false;
+
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strcmp(de->d_name, "sysprompt.kv") == 0) {
+            free(legacy_path);
+            legacy_path = ds4_kvstore_path_join(cache_dir, de->d_name);
+            continue;
+        }
+        if (!agent_sysprompt_cache_name_matches(de->d_name)) continue;
+
+        char *path = ds4_kvstore_path_join(cache_dir, de->d_name);
+        if (!path) continue;
+        if (keep_path && strcmp(path, keep_path) == 0) {
+            keep_path_present = true;
+            free(path);
+            continue;
+        }
+        struct stat st;
+        time_t mtime = (stat(path, &st) == 0) ? st.st_mtime : 0;
+        if (len == cap) {
+            cap = cap ? cap * 2 : 16;
+            files = xrealloc(files, (size_t)cap * sizeof(files[0]));
+        }
+        files[len].path = path;
+        files[len].mtime = mtime;
+        len++;
+    }
+    closedir(d);
+
+    if (legacy_path) {
+        unlink(legacy_path);
+        free(legacy_path);
+    }
+
+    int keep_others = keep_path_present ? AGENT_SYSPROMPT_CACHE_KEEP - 1
+                                        : AGENT_SYSPROMPT_CACHE_KEEP;
+    if (len > keep_others) {
+        qsort(files, (size_t)len, sizeof(files[0]),
+              agent_sysprompt_cache_file_cmp_recent);
+        for (int i = keep_others; i < len; i++) unlink(files[i].path);
+    }
+    for (int i = 0; i < len; i++) free(files[i].path);
+    free(files);
+}
+
 static void agent_le_put64(uint8_t *p, uint64_t v) {
     for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i));
 }
@@ -4446,11 +4558,16 @@ static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
     return rc;
 }
 
-/* Start a new session at the system/tool prompt.  A fixed sysprompt.kv
- * checkpoint avoids paying this prefill cost repeatedly, but only when the
- * rendered prompt text still matches the file.  The same fixed path is shared
- * by Flash and Pro; agent_kv_load_path() checks the model id, so switching
- * model families rebuilds this cache instead of restoring incompatible KV. */
+/* Start a new session at the system/tool prompt.  A content-addressed
+ * sysprompt-<sha1hex16>.kv checkpoint avoids paying this prefill cost
+ * repeatedly: since the system prompt is now per-project (skills catalog,
+ * MCP schemas, project memory), keying the file by hash of the rendered text
+ * gives every distinct prompt its own stable, reusable cache file instead of
+ * one fixed name that would get stomped on every project switch. The same
+ * path is shared by Flash and Pro; agent_kv_load_path() checks the model id,
+ * so switching model families rebuilds this cache instead of restoring
+ * incompatible KV. The exact-text byte-compare inside agent_kv_load_path
+ * stays as defense-in-depth against hash collisions. */
 static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t err_len) {
     ds4_tokens sys = {0};
     agent_worker_build_system_tokens(w, &sys);
@@ -4462,6 +4579,12 @@ static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t e
         ds4_tokens_free(&sys);
         return false;
     }
+
+    char sysprompt_path[PATH_MAX];
+    agent_sysprompt_cache_path(w->cache_dir, text, text_len,
+                               sysprompt_path, sizeof(sysprompt_path));
+    free(w->sysprompt_path);
+    w->sysprompt_path = xstrdup(sysprompt_path);
 
     bool loaded = false;
     char load_err[160] = {0};
@@ -4509,6 +4632,7 @@ static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t e
             } else {
                 agent_trace(w, "sysprompt kv stored file=%s tokens=%d",
                             w->sysprompt_path, w->transcript.len);
+                agent_sysprompt_cache_gc(w->cache_dir, w->sysprompt_path);
             }
         }
     }
@@ -7044,6 +7168,159 @@ static void test_agent_session_list_query_filters_non_session_filenames(void) {
     rmdir(fx);
 }
 
+/* Task 11: agent_sysprompt_cache_path() must be a pure function of
+ * (cache_dir, text, text_len): same input always yields the same path, any
+ * byte difference yields a different path, and the on-disk name has the
+ * exact shape "sysprompt-" + 16 lowercase hex + ".kv" -- the strict shape
+ * that keeps it outside ds4_kvstore_sha_hex_name()'s 40-hex session filter
+ * (see agent_session_list_query above). */
+static void test_agent_sysprompt_cache_path_stable_and_sensitive(void) {
+    const char *dir = "/tmp/ds4-fake-cache";
+    const char *text_a = "system prompt for project A";
+    const char *text_b = "system prompt for project B";
+
+    char path_a1[PATH_MAX], path_a2[PATH_MAX], path_b[PATH_MAX];
+    agent_sysprompt_cache_path(dir, text_a, strlen(text_a), path_a1, sizeof(path_a1));
+    agent_sysprompt_cache_path(dir, text_a, strlen(text_a), path_a2, sizeof(path_a2));
+    agent_sysprompt_cache_path(dir, text_b, strlen(text_b), path_b, sizeof(path_b));
+
+    AGENT_TEST_ASSERT(strcmp(path_a1, path_a2) == 0);
+    AGENT_TEST_ASSERT(strcmp(path_a1, path_b) != 0);
+
+    const char *base = strrchr(path_a1, '/');
+    AGENT_TEST_ASSERT(base != NULL);
+    if (!base) return;
+    base++;
+    AGENT_TEST_ASSERT(strlen(base) == 29);
+    AGENT_TEST_ASSERT(strncmp(base, "sysprompt-", 10) == 0);
+    AGENT_TEST_ASSERT(strcmp(base + 26, ".kv") == 0);
+    for (int i = 0; i < 16; i++) {
+        char c = base[10 + i];
+        AGENT_TEST_ASSERT((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'));
+    }
+
+    char full_sha[41];
+    ds4_kvstore_sha1_bytes_hex(text_a, strlen(text_a), full_sha);
+    AGENT_TEST_ASSERT(strncmp(base + 10, full_sha, 16) == 0);
+}
+
+/* Create (or truncate) path with placeholder content and force its mtime,
+ * so GC ordering tests don't need to sleep between fixture files. */
+static void agent_test_touch_with_mtime(const char *path, time_t t) {
+    FILE *fp = fopen(path, "wb");
+    if (fp) { fputs("kv", fp); fclose(fp); }
+    struct timespec times[2] = { { t, 0 }, { t, 0 } };
+    int fd = open(path, O_WRONLY);
+    if (fd >= 0) {
+        futimens(fd, times);
+        close(fd);
+    }
+}
+
+/* Task 11 GC: 11 well-formed sysprompt-<hex16>.kv files plus a legacy
+ * sysprompt.kv, a session-like 40-hex name, and a malformed hex suffix.
+ * After gc(keep=newest): exactly 8 well-formed files survive (including
+ * keep_path), the legacy file is always gone, and both the session-like and
+ * malformed names are left untouched because their shape never matches. */
+static void test_agent_sysprompt_cache_gc_keeps_8_most_recent(void) {
+    char tmpl[] = "/tmp/ds4_sysprompt_gc_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    AGENT_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    time_t base = 1700000000;
+    char paths[11][PATH_MAX];
+    for (int i = 0; i < 11; i++) {
+        char name[64];
+        snprintf(name, sizeof(name), "sysprompt-%016x.kv", (unsigned)i);
+        snprintf(paths[i], sizeof(paths[i]), "%s/%s", fx, name);
+        agent_test_touch_with_mtime(paths[i], base + i); /* i==10 is newest */
+    }
+
+    char legacy_path[PATH_MAX];
+    snprintf(legacy_path, sizeof(legacy_path), "%s/sysprompt.kv", fx);
+    agent_test_touch_with_mtime(legacy_path, base + 1000); /* newest of all, still eligible */
+
+    char session_path[PATH_MAX];
+    snprintf(session_path, sizeof(session_path), "%s/%s", fx,
+             "0123456789abcdef0123456789abcdef01234567.kv");
+    agent_test_touch_with_mtime(session_path, base + 2000);
+
+    char malformed_path[PATH_MAX];
+    snprintf(malformed_path, sizeof(malformed_path), "%s/sysprompt-XYZ.kv", fx);
+    agent_test_touch_with_mtime(malformed_path, base + 3000);
+
+    const char *keep_path = paths[10];
+    agent_sysprompt_cache_gc(fx, keep_path);
+
+    int kept = 0;
+    for (int i = 0; i < 11; i++) {
+        if (access(paths[i], F_OK) == 0) kept++;
+    }
+    AGENT_TEST_ASSERT(kept == 8);
+    AGENT_TEST_ASSERT(access(keep_path, F_OK) == 0);
+    /* the 3 oldest well-formed files (indices 0,1,2) should be gone */
+    AGENT_TEST_ASSERT(access(paths[0], F_OK) != 0);
+    AGENT_TEST_ASSERT(access(paths[1], F_OK) != 0);
+    AGENT_TEST_ASSERT(access(paths[2], F_OK) != 0);
+    AGENT_TEST_ASSERT(access(legacy_path, F_OK) != 0);
+    AGENT_TEST_ASSERT(access(session_path, F_OK) == 0);
+    AGENT_TEST_ASSERT(access(malformed_path, F_OK) == 0);
+
+    for (int i = 0; i < 11; i++) unlink(paths[i]);
+    unlink(session_path);
+    unlink(malformed_path);
+    rmdir(fx);
+}
+
+/* Task 11 GC: keep_path must survive even if it is older than 8 other
+ * matching files -- GC keeps keep_path plus the 7 newest others, 8 total. */
+static void test_agent_sysprompt_cache_gc_keep_path_priority(void) {
+    char tmpl[] = "/tmp/ds4_sysprompt_gc_keep_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    AGENT_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    time_t base = 1700000000;
+    char keep_path[PATH_MAX];
+    snprintf(keep_path, sizeof(keep_path), "%s/sysprompt-1111111111111111.kv", fx);
+    agent_test_touch_with_mtime(keep_path, base); /* oldest of all */
+
+    char other_paths[9][PATH_MAX];
+    for (int i = 0; i < 9; i++) {
+        char name[64];
+        snprintf(name, sizeof(name), "sysprompt-%016x.kv", (unsigned)(i + 2));
+        snprintf(other_paths[i], sizeof(other_paths[i]), "%s/%s", fx, name);
+        agent_test_touch_with_mtime(other_paths[i], base + 10 + i); /* all newer than keep_path */
+    }
+
+    agent_sysprompt_cache_gc(fx, keep_path);
+
+    AGENT_TEST_ASSERT(access(keep_path, F_OK) == 0);
+    int kept_others = 0;
+    for (int i = 0; i < 9; i++) {
+        if (access(other_paths[i], F_OK) == 0) kept_others++;
+    }
+    AGENT_TEST_ASSERT(kept_others == 7);
+    AGENT_TEST_ASSERT(access(other_paths[0], F_OK) != 0); /* 2 oldest others GC'd */
+    AGENT_TEST_ASSERT(access(other_paths[1], F_OK) != 0);
+
+    for (int i = 0; i < 9; i++) unlink(other_paths[i]);
+    unlink(keep_path);
+    rmdir(fx);
+}
+
+static void test_agent_sysprompt_cache_gc_missing_or_empty_dir(void) {
+    agent_sysprompt_cache_gc("/tmp/ds4-sysprompt-gc-missing-dir-xyz", NULL);
+
+    char tmpl[] = "/tmp/ds4_sysprompt_gc_empty_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    AGENT_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+    agent_sysprompt_cache_gc(fx, NULL);
+    rmdir(fx);
+}
+
 static void ds4_agent_unit_tests_run(void) {
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
@@ -7057,6 +7334,10 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_parse_options_resume_flags();
     test_agent_session_list_query_empty_or_missing_dir();
     test_agent_session_list_query_filters_non_session_filenames();
+    test_agent_sysprompt_cache_path_stable_and_sensitive();
+    test_agent_sysprompt_cache_gc_keeps_8_most_recent();
+    test_agent_sysprompt_cache_gc_keep_path_priority();
+    test_agent_sysprompt_cache_gc_missing_or_empty_dir();
 }
 #endif
 
@@ -10664,7 +10945,8 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
         .cancel_privdata = w,
     };
     w->web = ds4_web_create(&web_cfg);
-    w->sysprompt_path = ds4_kvstore_path_join(w->cache_dir, "sysprompt.kv");
+    /* w->sysprompt_path is derived lazily, per rendered prompt text, inside
+     * agent_worker_reset_to_sysprompt() -- see Task 11. */
     if (cfg->gen.trace_path && cfg->gen.trace_path[0]) {
         w->trace = fopen(cfg->gen.trace_path, "ab");
         if (!w->trace) {
