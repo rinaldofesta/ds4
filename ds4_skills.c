@@ -211,10 +211,21 @@ static void sk_list_push(ds4_skill_list *out, char *name, char *description, cha
     out->len++;
 }
 
+static int sk_meta_cmp_name(const void *a, const void *b) {
+    const ds4_skill_meta *ma = (const ds4_skill_meta *)a;
+    const ds4_skill_meta *mb = (const ds4_skill_meta *)b;
+    return strcmp(ma->name, mb->name);
+}
+
 /* entry_dir is "<root>/skills/<subdir>". Reads and validates its SKILL.md;
  * anything wrong is fail-open (warn + skip), never fatal. A directory under
- * skills/ with no SKILL.md at all is simply not a skill, silently. */
-static void sk_scan_one(const char *entry_dir, ds4_skill_list *out,
+ * skills/ with no SKILL.md at all is simply not a skill, silently.
+ *
+ * segment_start is the index in out->v where the current root's entries
+ * began: a name collision against an index >= segment_start is a same-root
+ * duplicate (warned); a collision against an earlier index is cross-root
+ * shadowing by a higher-precedence root (silent, expected). */
+static void sk_scan_one(const char *entry_dir, ds4_skill_list *out, int segment_start,
                         char *warn, size_t warn_len) {
     char *md_path = sk_join(entry_dir, "SKILL.md");
     if (!md_path) return;
@@ -267,15 +278,24 @@ static void sk_scan_one(const char *entry_dir, ds4_skill_list *out,
         return;
     }
     free(buf);
-    free(md_path);
 
-    if (ds4_skills_find(out, name)) {
-        /* Already discovered from a higher-precedence root; shadowing, not
-         * an error. */
+    const ds4_skill_meta *existing = ds4_skills_find(out, name);
+    if (existing) {
+        int idx = (int)(existing - out->v);
+        if (idx >= segment_start) {
+            /* Two different directories under the same root declared the
+             * same frontmatter name; the first one scanned wins. */
+            sk_warn_append(warn, warn_len, md_path,
+                           "duplicate skill name within this root, first one scanned wins, skipped");
+        }
+        /* Else: already discovered from a higher-precedence root; shadowing,
+         * not an error. */
+        free(md_path);
         free(name);
         free(description);
         return;
     }
+    free(md_path);
     sk_list_push(out, name, description, sk_strdup(entry_dir));
 }
 
@@ -291,6 +311,8 @@ void ds4_skills_scan(const ds4_config *cfg, ds4_skill_list *out, char *warn, siz
         char *skills_dir = sk_join(root, "skills");
         if (!skills_dir) continue;
 
+        int segment_start = out->len;
+
         DIR *d = opendir(skills_dir);
         if (!d) {
             if (errno != ENOENT)
@@ -305,11 +327,23 @@ void ds4_skills_scan(const ds4_config *cfg, ds4_skill_list *out, char *warn, siz
             if (!entry_dir) continue;
             struct stat st;
             if (stat(entry_dir, &st) == 0 && S_ISDIR(st.st_mode))
-                sk_scan_one(entry_dir, out, warn, warn_len);
+                sk_scan_one(entry_dir, out, segment_start, warn, warn_len);
             free(entry_dir);
         }
         closedir(d);
         free(skills_dir);
+
+        /* Directory enumeration order (readdir) is not deterministic across
+         * filesystems/runs; sort this root's newly-added segment by name so
+         * the catalog text -- and anything keyed on it, like a future
+         * content-addressed sysprompt cache -- is stable across restarts.
+         * Cross-root precedence (project before user) is untouched since
+         * each root's segment is sorted only among itself, after its own
+         * insertions are complete. */
+        if (out->len - segment_start > 1) {
+            qsort(out->v + segment_start, (size_t)(out->len - segment_start),
+                  sizeof(out->v[0]), sk_meta_cmp_name);
+        }
     }
 }
 
@@ -791,6 +825,137 @@ static void test_golden_catalog_and_empty(void) {
     ds4_skills_list_free(&list);
 }
 
+static void test_sort_within_root_segment(void) {
+    char tmpl[] = "/tmp/ds4_skills_sort_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    SK_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    char *proj = sk_test_join(fx, "proj");
+    char *proj_ds4 = sk_test_join(proj, ".ds4");
+    char *skills = sk_test_join(proj_ds4, "skills");
+    sk_test_mkdir_p(skills);
+
+    /* Directory names are deliberately not alphabetical, and differ from the
+     * frontmatter names, so the test cannot pass just because readdir()
+     * happened to already return entries in sorted order. */
+    struct { const char *dir; const char *name; const char *desc; } fixtures[] = {
+        { "dir-zeta", "zeta", "Zeta skill." },
+        { "dir-alpha", "alpha", "Alpha skill." },
+        { "dir-mu", "mu", "Mu skill." },
+    };
+    for (size_t i = 0; i < sizeof(fixtures) / sizeof(fixtures[0]); i++) {
+        char *d = sk_test_join(skills, fixtures[i].dir);
+        sk_test_mkdir_p(d);
+        char *md = sk_test_join(d, "SKILL.md");
+        char content[256];
+        snprintf(content, sizeof(content), "---\nname: %s\ndescription: %s\n---\nbody\n",
+                 fixtures[i].name, fixtures[i].desc);
+        sk_test_write_file(md, content);
+        free(md);
+        free(d);
+    }
+
+    char *home = sk_test_join(fx, "home");
+    sk_test_mkdir_p(home);
+    char *saved_home;
+    sk_test_setenv_home(home, &saved_home);
+
+    ds4_config *cfg = ds4_config_load(proj, NULL, 0);
+    SK_TEST_ASSERT(cfg != NULL);
+    if (cfg) {
+        ds4_skill_list list = {0};
+        ds4_skills_scan(cfg, &list, NULL, 0);
+        SK_TEST_ASSERT(list.len == 3);
+        if (list.len == 3) {
+            SK_TEST_ASSERT(strcmp(list.v[0].name, "alpha") == 0);
+            SK_TEST_ASSERT(strcmp(list.v[1].name, "mu") == 0);
+            SK_TEST_ASSERT(strcmp(list.v[2].name, "zeta") == 0);
+        }
+        char *catalog = ds4_skills_catalog_prompt_text(&list);
+        SK_TEST_ASSERT(catalog != NULL);
+        if (catalog) {
+            const char *expected_tail =
+                "Available skills:\n"
+                "- alpha: Alpha skill.\n"
+                "- mu: Mu skill.\n"
+                "- zeta: Zeta skill.\n";
+            SK_TEST_ASSERT(strstr(catalog, expected_tail) != NULL);
+            free(catalog);
+        }
+        ds4_skills_list_free(&list);
+    }
+    ds4_config_free(cfg);
+
+    sk_test_restore_home(saved_home);
+    free(proj); free(proj_ds4); free(skills); free(home);
+    sk_test_rmtree(fx);
+}
+
+static void test_same_root_duplicate_name_warns(void) {
+    char tmpl[] = "/tmp/ds4_skills_dup_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    SK_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    char *proj = sk_test_join(fx, "proj");
+    char *proj_ds4 = sk_test_join(proj, ".ds4");
+    char *skills = sk_test_join(proj_ds4, "skills");
+    sk_test_mkdir_p(skills);
+
+    /* Two different directories under the SAME root declaring the same
+     * frontmatter name -- distinct from cross-root shadowing, which stays
+     * silent. */
+    char *dir_a = sk_test_join(skills, "dup-a");
+    sk_test_mkdir_p(dir_a);
+    char *md_a = sk_test_join(dir_a, "SKILL.md");
+    sk_test_write_file(md_a, "---\nname: dupname\ndescription: From A.\n---\nbody a\n");
+
+    char *dir_b = sk_test_join(skills, "dup-b");
+    sk_test_mkdir_p(dir_b);
+    char *md_b = sk_test_join(dir_b, "SKILL.md");
+    sk_test_write_file(md_b, "---\nname: dupname\ndescription: From B.\n---\nbody b\n");
+
+    char *home = sk_test_join(fx, "home");
+    sk_test_mkdir_p(home);
+    char *saved_home;
+    sk_test_setenv_home(home, &saved_home);
+
+    ds4_config *cfg = ds4_config_load(proj, NULL, 0);
+    SK_TEST_ASSERT(cfg != NULL);
+    if (cfg) {
+        char warn[512] = {0};
+        ds4_skill_list list = {0};
+        ds4_skills_scan(cfg, &list, warn, sizeof(warn));
+
+        int count = 0;
+        for (int i = 0; i < list.len; i++)
+            if (!strcmp(list.v[i].name, "dupname")) count++;
+        SK_TEST_ASSERT(count == 1);
+        SK_TEST_ASSERT(strstr(warn, "duplicate skill name") != NULL);
+
+        const ds4_skill_meta *m = ds4_skills_find(&list, "dupname");
+        SK_TEST_ASSERT(m != NULL);
+        if (m) {
+            /* Which physical directory wins a same-root collision is
+             * readdir()-order dependent (unspecified -- sorting happens
+             * after all of a root's insertions complete, so it does not
+             * make the dedup-at-insert race deterministic). Exactly one
+             * winner is required, and it must be one of the two genuine
+             * candidates, never corrupted or empty. */
+            SK_TEST_ASSERT(strcmp(m->description, "From A.") == 0 ||
+                           strcmp(m->description, "From B.") == 0);
+        }
+        ds4_skills_list_free(&list);
+    }
+    ds4_config_free(cfg);
+
+    sk_test_restore_home(saved_home);
+    free(proj); free(proj_ds4); free(skills);
+    free(dir_a); free(md_a); free(dir_b); free(md_b); free(home);
+    sk_test_rmtree(fx);
+}
+
 static void test_find_load_unknown(void) {
     ds4_skill_list list = {0};
     SK_TEST_ASSERT(ds4_skills_find(&list, "nope") == NULL);
@@ -805,6 +970,8 @@ int ds4_skills_unit_tests_run(void) {
     test_sanitization();
     test_golden_catalog_and_empty();
     test_find_load_unknown();
+    test_sort_within_root_segment();
+    test_same_root_duplicate_name_warns();
     return sk_test_failures;
 }
 #endif
