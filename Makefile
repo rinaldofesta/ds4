@@ -248,4 +248,5 @@ ds4_json_test: tests/ds4_json_test.c ds4_json.c ds4_json.h
 	$(CC) -O2 -Wall -Wextra -std=c99 -o tests/ds4_json_test tests/ds4_json_test.c
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test tests/test_q4k_dot tests/ds4_json_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test tests/test_q4k_dot *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f tests/ds4_json_test
