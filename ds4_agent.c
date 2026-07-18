@@ -7,6 +7,7 @@
 #include "ds4_config.h"
 #include "ds4_skills.h"
 #include "ds4_mcp.h"
+#include "ds4_commands.h"
 #include "linenoise.h"
 
 #include <errno.h>
@@ -321,6 +322,14 @@ typedef struct {
 static volatile sig_atomic_t agent_sigint;
 static agent_worker *agent_completion_worker;
 
+/* User-defined slash commands discovered at startup. File-scope rather than
+ * an agent_worker field because agent_slash_command_known() -- a free
+ * function with no agent_worker access, called from the REPL's line-editing
+ * hot path -- needs it too. Populated once in agent_worker_init(), on the
+ * main thread, before the worker pthread is created (see the comment above
+ * that call site); read-only for the rest of the process, so no locking. */
+static ds4_command_list g_agent_commands;
+
 static void worker_apply_pending_power(agent_worker *w);
 static void agent_trace(agent_worker *w, const char *fmt, ...);
 static void agent_trace_text(agent_worker *w, const char *label,
@@ -445,19 +454,46 @@ static bool agent_slash_command_with_args(const char *cmd, const char *name) {
            (cmd[len] == '\0' || isspace((unsigned char)cmd[len]));
 }
 
+/* Splits cmd (already trimmed of outer whitespace, as the REPL always passes
+ * it) into its first whitespace-delimited word -- including the leading '/'
+ * -- and the remaining argument text with its own leading whitespace
+ * stripped ("" if none). Returns false, leaving *rest unset, if the word
+ * doesn't fit in buf; buf only needs to be comfortably larger than the
+ * longest valid ds4_commands name, so this just rejects garbage safely. */
+static bool agent_split_first_word(const char *cmd, char *buf, size_t buflen, const char **rest) {
+    size_t wlen = 0;
+    while (cmd[wlen] && !isspace((unsigned char)cmd[wlen])) wlen++;
+    if (wlen == 0 || wlen >= buflen) return false;
+    memcpy(buf, cmd, wlen);
+    buf[wlen] = '\0';
+    const char *r = cmd + wlen;
+    while (*r == ' ' || *r == '\t') r++;
+    *rest = r;
+    return true;
+}
+
 static bool agent_slash_command_known(const char *cmd) {
-    return !strcmp(cmd, "/help") ||
-           !strcmp(cmd, "/save") ||
-           !strcmp(cmd, "/compact") ||
-           !strcmp(cmd, "/list") ||
-           !strcmp(cmd, "/quit") ||
-           !strcmp(cmd, "/exit") ||
-           !strcmp(cmd, "/new") ||
-           agent_slash_command_with_args(cmd, "/power") ||
-           agent_slash_command_with_args(cmd, "/switch") ||
-           agent_slash_command_with_args(cmd, "/del") ||
-           agent_slash_command_with_args(cmd, "/strip") ||
-           agent_slash_command_with_args(cmd, "/history");
+    if (!strcmp(cmd, "/help") ||
+        !strcmp(cmd, "/save") ||
+        !strcmp(cmd, "/compact") ||
+        !strcmp(cmd, "/list") ||
+        !strcmp(cmd, "/quit") ||
+        !strcmp(cmd, "/exit") ||
+        !strcmp(cmd, "/new") ||
+        agent_slash_command_with_args(cmd, "/power") ||
+        agent_slash_command_with_args(cmd, "/switch") ||
+        agent_slash_command_with_args(cmd, "/del") ||
+        agent_slash_command_with_args(cmd, "/strip") ||
+        agent_slash_command_with_args(cmd, "/history"))
+        return true;
+
+    /* cmd is the whole trimmed input line here, not just the command word --
+     * it may carry trailing arguments (e.g. "/review some notes"). File-based
+     * commands are looked up by first word only, so split that off first. */
+    char word[80];
+    const char *rest;
+    return agent_split_first_word(cmd, word, sizeof(word), &rest) &&
+           ds4_commands_known(&g_agent_commands, word);
 }
 
 static uint64_t parse_u64(const char *s, const char *opt) {
@@ -6326,10 +6362,33 @@ static void test_agent_tool_skill_dispatch(void) {
     rmdir(fx);
 }
 
+/* Drives agent_slash_command_known() -- seam 4 -- directly, since it takes
+ * no agent_worker and reads the file-scope g_agent_commands. */
+static void test_agent_slash_command_known_file_commands(void) {
+    /* Empty list (the byte-identical-with-no-command-files path): an
+     * otherwise-unknown word stays unknown, built-ins are untouched. */
+    AGENT_TEST_ASSERT(!agent_slash_command_known("/mycmd"));
+    AGENT_TEST_ASSERT(agent_slash_command_known("/help"));
+
+    g_agent_commands.v = xmalloc(sizeof(ds4_command_meta));
+    g_agent_commands.len = 1;
+    g_agent_commands.cap = 1;
+    g_agent_commands.v[0].name = xstrdup("mycmd");
+    g_agent_commands.v[0].path = xstrdup("/nonexistent/mycmd.md");
+
+    AGENT_TEST_ASSERT(agent_slash_command_known("/mycmd"));
+    AGENT_TEST_ASSERT(!agent_slash_command_known("/nope"));
+    AGENT_TEST_ASSERT(agent_slash_command_known("/help")); /* built-in still wins */
+
+    ds4_commands_list_free(&g_agent_commands);
+    AGENT_TEST_ASSERT(!agent_slash_command_known("/mycmd"));
+}
+
 static void ds4_agent_unit_tests_run(void) {
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
     test_agent_tool_skill_dispatch();
+    test_agent_slash_command_known_file_commands();
 }
 #endif
 
@@ -9638,17 +9697,26 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
      * .ds4 discovery walks up from the intended working directory. */
     char cfg_warn[512] = {0};
     w->config = ds4_config_load(NULL, cfg_warn, sizeof(cfg_warn));
+    /* g_agent_commands is file-scope (see its declaration) because
+     * agent_slash_command_known() needs it and has no agent_worker access;
+     * this is the only writer, and it runs here on the main thread, before
+     * pthread_create() below starts the worker thread -- so no locking is
+     * needed for the read-only access that follows from either thread. */
+    char commands_warn[512] = {0};
+    ds4_commands_scan(w->config, &g_agent_commands, commands_warn, sizeof(commands_warn));
     char skills_warn[512] = {0};
     ds4_skills_scan(w->config, &w->skills, skills_warn, sizeof(skills_warn));
     char mcp_warn[512] = {0};
     w->mcp = ds4_mcp_registry_create(w->config, NULL, mcp_warn, sizeof(mcp_warn));
-    if (cfg_warn[0] || skills_warn[0] || mcp_warn[0]) {
+    if (cfg_warn[0] || commands_warn[0] || skills_warn[0] || mcp_warn[0]) {
         if (cfg->non_interactive) {
             if (cfg_warn[0]) fputs(cfg_warn, stderr);
+            if (commands_warn[0]) fputs(commands_warn, stderr);
             if (skills_warn[0]) fputs(skills_warn, stderr);
             if (mcp_warn[0]) fputs(mcp_warn, stderr);
         } else {
             if (cfg_warn[0]) agent_publishf_system_status(w, "%s", cfg_warn);
+            if (commands_warn[0]) agent_publishf_system_status(w, "%s", commands_warn);
             if (skills_warn[0]) agent_publishf_system_status(w, "%s", skills_warn);
             if (mcp_warn[0]) agent_publishf_system_status(w, "%s", mcp_warn);
         }
@@ -9687,6 +9755,7 @@ static void agent_worker_free(agent_worker *w) {
     ds4_session_free(w->session);
     ds4_tokens_free(&w->transcript);
     ds4_skills_list_free(&w->skills);
+    ds4_commands_list_free(&g_agent_commands);
     ds4_mcp_registry_free(w->mcp);
     ds4_config_free(w->config);
     free(w->cache_dir);
@@ -10232,6 +10301,8 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                 int saved_output_col = editor.output_col;
                 editor_stop(&editor);
                 bool busy = !worker_is_idle(&worker);
+                char cmdword[80];
+                const char *cmdargs = "";
                 if (!cmd[0]) {
                     /* Empty input: just reopen the editor. */
                 } else if (!strcmp(cmd, "/help")) {
@@ -10371,6 +10442,26 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                     if (!agent_worker_show_history(&worker, history_turns,
                                                    err, sizeof(err)))
                         printf("history failed: %s\n", err);
+                } else if (cmd[0] == '/' &&
+                           agent_split_first_word(cmd, cmdword, sizeof(cmdword), &cmdargs) &&
+                           ds4_commands_known(&g_agent_commands, cmdword)) {
+                    /* A file-based command: reaching this branch means it is
+                     * known (seam 4) and, by the busy-check above, the
+                     * worker is idle. Expand and submit through the exact
+                     * same path a typed prompt takes. */
+                    char *expanded = ds4_commands_expand(&g_agent_commands, cmdword, cmdargs);
+                    if (expanded) {
+                        linenoiseHistoryAdd(cmd);
+                        linenoiseHistorySave(hist);
+                        if (worker_submit(&worker, expanded)) {
+                            agent_echo_user_prompt(expanded);
+                        } else {
+                            restore_line = xstrdup(cmd);
+                        }
+                        free(expanded);
+                    } else {
+                        printf("command failed: %s\n", cmd);
+                    }
                 } else if (busy) {
                     agent_prompt_queue_push(&queue, cmd);
                 } else {
