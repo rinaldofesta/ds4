@@ -190,6 +190,9 @@ ds4_commands.o: ds4_commands.c ds4_commands.h ds4_config.h
 ds4_hooks.o: ds4_hooks.c ds4_hooks.h ds4_json.h ds4_config.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_hooks.c
 
+ds4_permissions.o: ds4_permissions.c ds4_permissions.h ds4_json.h ds4_config.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_permissions.c
+
 ds4_test.o: tests/ds4_test.c ds4_server.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h rax.h
 	$(CC) $(CFLAGS) -Wno-unused-function -c -o $@ tests/ds4_test.c
 
@@ -249,7 +252,7 @@ else
 	$(NVCC) $(NVCCFLAGS) -o $@ ds4_agent_test.o ds4_help.o ds4_web.o ds4_kvstore.o ds4_json.o ds4_config.o ds4_skills.o ds4_mcp.o ds4_commands.o ds4_hooks.o linenoise.o $(CORE_OBJS) $(CUDA_LDLIBS)
 endif
 
-test: ds4_test ds4_agent_test ds4-eval q4k-dot-test ds4_json_test ds4_config_test ds4_skills_test ds4_mcp_test ds4_commands_test ds4_hooks_test
+test: ds4_test ds4_agent_test ds4-eval q4k-dot-test ds4_json_test ds4_config_test ds4_skills_test ds4_mcp_test ds4_commands_test ds4_hooks_test ds4_permissions_test
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
 	./ds4_test
@@ -259,6 +262,7 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test ds4_json_test ds4_config_tes
 	./tests/ds4_mcp_test
 	./tests/ds4_commands_test
 	./tests/ds4_hooks_test
+	./tests/ds4_permissions_test
 
 q4k-dot-test: tests/test_q4k_dot.c
 	$(CC) -O2 -Wall -Wextra -std=c99 -o tests/test_q4k_dot tests/test_q4k_dot.c -lm -pthread
@@ -285,6 +289,9 @@ ds4_commands_test: tests/ds4_commands_test.c ds4_commands.c ds4_commands.h ds4_c
 ds4_hooks_test: tests/ds4_hooks_test.c ds4_hooks.c ds4_hooks.h ds4_config.c ds4_config.h ds4_json.c ds4_json.h
 	$(CC) -O2 -Wall -Wextra -std=c99 -o tests/ds4_hooks_test tests/ds4_hooks_test.c ds4_config.c ds4_json.c
 
+ds4_permissions_test: tests/ds4_permissions_test.c ds4_permissions.c ds4_permissions.h ds4_config.c ds4_config.h ds4_json.c ds4_json.h
+	$(CC) -O2 -Wall -Wextra -std=c99 -o tests/ds4_permissions_test tests/ds4_permissions_test.c ds4_config.c ds4_json.c
+
 clean:
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test tests/test_q4k_dot *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
-	rm -f tests/ds4_json_test tests/ds4_config_test tests/ds4_skills_test tests/ds4_mcp_test tests/mock_mcp_server tests/ds4_commands_test tests/ds4_hooks_test
+	rm -f tests/ds4_json_test tests/ds4_config_test tests/ds4_skills_test tests/ds4_mcp_test tests/mock_mcp_server tests/ds4_commands_test tests/ds4_hooks_test tests/ds4_permissions_test
