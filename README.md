@@ -538,6 +538,74 @@ in order to make it ready for prime time. When finally the agent will reach
 the wanted shape, we will *likely* split the server and the client creating a stateful
 session-based protocol that can recreate all that in a client-server way.
 
+### Harness extensions (.ds4 directory) — fork feature
+
+This fork extends `ds4-agent` with a project/user configuration layer.
+All of it is strictly opt-in: with no `.ds4` directory, no memory file and
+no new flags, the agent behaves byte-identically to the base version.
+
+The agent looks for a project root by walking up from the current directory
+to the nearest ancestor containing `.ds4/` or `.git`, and also reads
+user-level configuration from `~/.ds4/`. Project entries win over user
+entries. The layout:
+
+    <project>/.ds4/
+      settings.json         permissions and hooks (see below)
+      mcp.json              MCP servers, standard {"mcpServers": {...}} shape
+      skills/<name>/SKILL.md
+      commands/<name>.md    custom slash commands
+      plugins/<name>/       bundles of skills/, commands/, mcp.json, hooks.json
+    ~/.ds4/                 same layout, lower precedence (kvcache/ also lives here)
+    <project>/AGENTS.md     project memory, read into the system prompt
+                            (DS4.md is used if AGENTS.md is absent)
+
+**Skills** are Agent Skills-style instruction files: YAML-ish frontmatter
+with `name:` and `description:`, then a markdown body. The catalog
+(names + descriptions only) goes into the system prompt; the model loads a
+skill's full body on demand with the native `skill` tool, so each skill
+costs about one prompt line until used.
+
+**MCP servers** from `mcp.json` are spawned over stdio (JSON-RPC 2.0) and
+their tools appear to the model as `mcp__<server>__<tool>`. Tool
+descriptions and schemas are sanitized before entering the prompt, and a
+server that fails to start is skipped with a warning, never fatal.
+
+**Slash commands**: `/name args` submits the body of `commands/name.md`
+with `$ARGUMENTS` replaced by `args`. Built-in commands always win.
+
+**Hooks** run shell commands around tool execution. In `settings.json`:
+
+    {"hooks": {"PreToolUse":  [{"matcher": "bash", "command": "./check.sh"}],
+               "PostToolUse": [{"matcher": "*", "command": "./log.sh"}]}}
+
+The hook receives a JSON payload on stdin; exit code 0 allows, 2 blocks
+(stderr becomes the model-visible reason), anything else is ignored with a
+warning. `matcher` is a glob on the tool name; `timeout_ms` is optional.
+
+**Permissions** gate risky tools, opt-in via `settings.json`:
+
+    {"permissions": {"confirm": ["bash", "write", "edit"],
+                     "allow":   ["bash:make *", "bash:git status*"]}}
+
+Tools listed in `confirm` require a matching `allow` rule, an interactive
+y/N approval, or the `--auto-approve` flag. In `--non-interactive` mode an
+unapproved call fails with an explanatory tool error instead of prompting.
+
+**Plugins** are content bundles: a directory under `.ds4/plugins/` whose
+`skills/`, `commands/` and `mcp.json` are merged in at lower precedence
+than the containing root. A plugin may also ship a `hooks.json` that
+registers hooks automatically — hooks execute arbitrary shell commands, so
+only install plugins you trust, the same way you already trust a project's
+`settings.json` when running the agent inside a cloned repository.
+Plugins can not carry `settings.json`: permissions always come from the
+project or user configuration only.
+
+**Sessions**: `--continue` resumes the most recently saved session and
+`--resume <sha>` a specific one (same IDs as `/list`). The system prompt
+KV bootstrap is content-addressed (`sysprompt-<hash>.kv`), so each
+project/config combination keeps its own warm prefill cache; stale entries
+are garbage collected automatically.
+
 ## Benchmarking
 
 `ds4-bench` measures instantaneous prefill and generation throughput at context
