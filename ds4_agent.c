@@ -127,6 +127,16 @@ typedef struct {
     pthread_t thread;
     pthread_mutex_t mu;
     pthread_cond_t cond;
+    /* Separate from `cond` deliberately: `cond` already carries several
+     * distinct single-target wakeups (web/permission confirm relays, queued-
+     * user-drain), always one worker-thread waiter answered by a single
+     * pthread_cond_signal() from the UI thread. resume_settled is the first
+     * case where the UI/main thread itself blocks waiting on the worker, so
+     * it gets its own condvar to avoid any chance of stealing a wakeup meant
+     * for one of those other relays (see worker_main and
+     * worker_wait_resume_settled()). */
+    pthread_cond_t resume_cond;
+    bool resume_settled;
     int wake_fd[2];
     FILE *trace;
     bool wake_pending;
@@ -5269,13 +5279,22 @@ static void agent_session_list_push(agent_session_list_item **v, int *len,
  *
  * Returns the entry count and sets *out to a freshly allocated, sorted array
  * (NULL if 0), or returns -1 with *out NULL if the cache directory itself
- * could not be opened (errno is left as opendir() set it). Callers that only
- * need "is there anything to resume" can treat <= 0 as one case. */
+ * could not be opened. On that -1 path, if opendir_errno is non-NULL it is
+ * set to the errno opendir() itself reported, captured right here rather
+ * than left for the caller to read across the function-return boundary
+ * (where an unrelated call could have already clobbered it). Callers that
+ * only need "is there anything to resume" can treat <= 0 as one case and
+ * pass NULL. */
 static int agent_session_list_query(agent_worker *w,
-                                    agent_session_list_item **out) {
+                                    agent_session_list_item **out,
+                                    int *opendir_errno) {
     *out = NULL;
+    if (opendir_errno) *opendir_errno = 0;
     DIR *d = opendir(w->cache_dir);
-    if (!d) return -1;
+    if (!d) {
+        if (opendir_errno) *opendir_errno = errno;
+        return -1;
+    }
 
     int cols = renderer_terminal_cols();
     size_t title_budget = cols > 16 ? (size_t)(cols - 12) : 20;
@@ -5314,9 +5333,10 @@ static int agent_session_list_query(agent_worker *w,
  * ignored because it is an implementation cache, not a user session. */
 static void agent_worker_list_sessions(agent_worker *w) {
     agent_session_list_item *sessions = NULL;
-    int sessions_len = agent_session_list_query(w, &sessions);
+    int opendir_errno = 0;
+    int sessions_len = agent_session_list_query(w, &sessions, &opendir_errno);
     if (sessions_len < 0) {
-        printf("no sessions: %s\n", strerror(errno));
+        printf("no sessions: %s\n", strerror(opendir_errno));
         return;
     }
     if (!sessions_len) {
@@ -5688,6 +5708,7 @@ static bool agent_worker_switch_session(agent_worker *w, const char *prefix,
         pthread_mutex_unlock(&w->mu);
         printf("switched to session %.8s (%d tokens%s)\n",
                sha, w->transcript.len, stripped ? ", rebuilt from text" : "");
+        fflush(stdout);
         if (history_turns > 0)
             (void)agent_worker_show_history(w, history_turns, err, err_len);
     } else {
@@ -6941,12 +6962,15 @@ static void test_agent_parse_options_resume_flags(void) {
 }
 
 /* agent_session_list_query() on a cache_dir that was never created (opendir
- * fails) returns -1 with *out left NULL; an existing-but-empty directory
- * returns 0 with *out left NULL. Both are "nothing to resume" for callers
- * that only test count > 0, but the query keeps them distinguishable so
- * agent_worker_list_sessions can still print its original "no sessions:
- * <errno>" vs "no saved sessions" messages unchanged. w.engine stays NULL:
- * ds4_engine_model_id() ignores it (returns a fixed constant). */
+ * fails) returns -1 with *out left NULL and *opendir_errno set to what
+ * opendir() itself reported (captured at the failing call, not read back
+ * across the return boundary in the caller); an existing-but-empty directory
+ * returns 0 with *out left NULL and *opendir_errno left at 0. Both -1 and 0
+ * are "nothing to resume" for callers that only test count > 0, but the
+ * query keeps them distinguishable so agent_worker_list_sessions can still
+ * print its original "no sessions: <errno>" vs "no saved sessions" messages
+ * unchanged. w.engine stays NULL: ds4_engine_model_id() ignores it (returns
+ * a fixed constant). */
 static void test_agent_session_list_query_empty_or_missing_dir(void) {
     char tmpl[] = "/tmp/ds4_agent_session_query_missing_test.XXXXXX";
     char *fx = mkdtemp(tmpl);
@@ -6959,18 +6983,22 @@ static void test_agent_session_list_query_empty_or_missing_dir(void) {
     agent_worker w = {0};
     w.cache_dir = missing_dir;
     agent_session_list_item *sessions = NULL;
-    int n = agent_session_list_query(&w, &sessions);
+    int opendir_errno = -1234;
+    int n = agent_session_list_query(&w, &sessions, &opendir_errno);
     AGENT_TEST_ASSERT(n < 0);
     AGENT_TEST_ASSERT(sessions == NULL);
+    AGENT_TEST_ASSERT(opendir_errno == ENOENT);
 
     char empty_dir[PATH_MAX];
     snprintf(empty_dir, sizeof(empty_dir), "%s/kvcache-empty", fx);
     AGENT_TEST_ASSERT(mkdir(empty_dir, 0700) == 0);
     w.cache_dir = empty_dir;
     sessions = NULL;
-    n = agent_session_list_query(&w, &sessions);
+    opendir_errno = -1234;
+    n = agent_session_list_query(&w, &sessions, &opendir_errno);
     AGENT_TEST_ASSERT(n == 0);
     AGENT_TEST_ASSERT(sessions == NULL);
+    AGENT_TEST_ASSERT(opendir_errno == 0);
 
     rmdir(empty_dir);
     rmdir(fx);
@@ -7004,7 +7032,7 @@ static void test_agent_session_list_query_filters_non_session_filenames(void) {
     agent_worker w = {0};
     w.cache_dir = fx;
     agent_session_list_item *sessions = NULL;
-    int n = agent_session_list_query(&w, &sessions);
+    int n = agent_session_list_query(&w, &sessions, NULL);
     AGENT_TEST_ASSERT(n == 0);
     AGENT_TEST_ASSERT(sessions == NULL);
 
@@ -9161,7 +9189,7 @@ static void *worker_main(void *arg) {
         }
     } else if (w->cfg->continue_last) {
         agent_session_list_item *items = NULL;
-        int n = agent_session_list_query(w, &items);
+        int n = agent_session_list_query(w, &items, NULL);
         if (n > 0) {
             char resume_err[160] = {0};
             if (!agent_worker_switch_session(w, items[0].entry.sha, 0,
@@ -9179,6 +9207,22 @@ static void *worker_main(void *arg) {
         }
         agent_session_list_free(items, n > 0 ? n : 0);
     }
+
+    /* Signal that the startup resume/continue attempt above (if any) has
+     * fully resolved, success or fail-open fallback alike. Always set, even
+     * with neither flag, so the field stays consistent -- but it is only
+     * ever waited on by run_agent()/run_agent_non_interactive() when
+     * cfg->resume_sha/continue_last was passed (worker_wait_resume_settled),
+     * right before they do anything with stdout/the terminal. Without that
+     * wait, agent_worker_switch_session()'s raw printf/fflush(stdout) calls
+     * above -- historically safe only because that function was previously
+     * called solely from the UI thread after it had suspended editor
+     * rendering -- could race the UI thread's own concurrent startup output. */
+    pthread_mutex_lock(&w->mu);
+    w->resume_settled = true;
+    agent_wake_locked(w);
+    pthread_cond_broadcast(&w->resume_cond);
+    pthread_mutex_unlock(&w->mu);
 
     while (true) {
         pthread_mutex_lock(&w->mu);
@@ -9358,6 +9402,24 @@ static bool worker_is_initialized(agent_worker *w, agent_status *status) {
     bool initialized = w->initialized;
     pthread_mutex_unlock(&w->mu);
     return initialized;
+}
+
+/* Block the calling thread (the UI/main thread) until worker_main() has
+ * fully resolved its startup --continue/--resume attempt, success or
+ * fail-open fallback alike (see the resume_settled comment in worker_main).
+ * Callers must only invoke this when cfg->resume_sha/continue_last was
+ * actually passed -- with neither flag, worker_main still sets
+ * resume_settled promptly, but nothing needs to wait on it, and skipping the
+ * call entirely keeps the no-flags startup path exactly as it was before
+ * this synchronization existed. Uses the dedicated resume_cond, not the
+ * shared cond used by the web/permission confirm relays and the queued-user-
+ * drain handshake, so this new UI-thread wait can never steal a wakeup meant
+ * for one of those worker-thread waiters. */
+static void worker_wait_resume_settled(agent_worker *w) {
+    pthread_mutex_lock(&w->mu);
+    while (!w->resume_settled)
+        pthread_cond_wait(&w->resume_cond, &w->mu);
+    pthread_mutex_unlock(&w->mu);
 }
 
 static bool stdout_is_tty(void) {
@@ -10523,6 +10585,7 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
     w->wake_fd[1] = -1;
     pthread_mutex_init(&w->mu, NULL);
     pthread_cond_init(&w->cond, NULL);
+    pthread_cond_init(&w->resume_cond, NULL);
     w->status.state = AGENT_WORKER_IDLE;
     if (pipe(w->wake_fd) != 0) return -1;
     int old_flags;
@@ -10641,6 +10704,7 @@ static void agent_worker_free(agent_worker *w) {
     free(w->cmd_text);
     free(w->out);
     pthread_cond_destroy(&w->cond);
+    pthread_cond_destroy(&w->resume_cond);
     pthread_mutex_destroy(&w->mu);
 }
 
@@ -10794,6 +10858,16 @@ static int agent_read_stdin_available(agent_input_buf *in, bool *eof) {
 static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
     agent_worker worker;
     if (agent_worker_init(&worker, engine, cfg) != 0) return 1;
+
+    /* Only with --continue/--resume: block until the worker's startup resume
+     * attempt has fully resolved before this thread starts writing to
+     * stdout, so agent_worker_switch_session()'s raw printf/fflush(stdout)
+     * (run on the worker thread in that case) cannot interleave with the
+     * write_all(STDOUT_FILENO, ...) calls the poll loop below issues for
+     * w->out content. Skipped entirely with neither flag: no new wait, no
+     * new state touched, byte-identical to before. */
+    if (cfg->resume_sha || cfg->continue_last)
+        worker_wait_resume_settled(&worker);
 
     const bool one_shot = cfg->gen.prompt != NULL;
     bool one_shot_submitted = false;
@@ -10969,6 +11043,16 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
     char statusline[4096];
     build_prompt_text(&st, prompt, sizeof(prompt));
     build_footer_text(&st, NULL, 80, statusline, sizeof(statusline));
+
+    /* Only with --continue/--resume: block until the worker's startup resume
+     * attempt has fully resolved before editor_start()/the welcome banner
+     * below take over the terminal, so agent_worker_switch_session()'s raw
+     * printf/fflush(stdout) (run on the worker thread in that case) cannot
+     * race the editor's ANSI-managed screen setup. Skipped entirely with
+     * neither flag: no new wait, no new state touched, byte-identical to
+     * before. */
+    if (cfg->resume_sha || cfg->continue_last)
+        worker_wait_resume_settled(&worker);
 
     agent_editor editor = {0};
     agent_prompt_queue queue = {0};
