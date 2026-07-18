@@ -6,6 +6,7 @@
 #include "ds4_json.h"
 #include "ds4_config.h"
 #include "ds4_skills.h"
+#include "ds4_mcp.h"
 #include "linenoise.h"
 
 #include <errno.h>
@@ -106,6 +107,7 @@ typedef struct {
     char *cache_dir;
     ds4_config *config;
     ds4_skill_list skills;
+    ds4_mcp_registry *mcp;
     char *sysprompt_path;
     char session_sha[41];
     char *session_title;
@@ -991,21 +993,44 @@ static char *agent_build_skills_reminder_line(agent_worker *w) {
     return line;
 }
 
+/* Names-only reminder of the currently discovered MCP tools; mirrors
+ * agent_build_skills_reminder_line. */
+static char *agent_build_mcp_reminder_line(agent_worker *w) {
+    int n = ds4_mcp_registry_tool_count(w->mcp);
+    if (n == 0) return NULL;
+    size_t cap = 32;
+    for (int i = 0; i < n; i++)
+        cap += strlen(ds4_mcp_registry_tool_at(w->mcp, i)->wire_name) + 2;
+    char *line = xmalloc(cap);
+    line[0] = '\0';
+    strcat(line, "Available MCP tools: ");
+    for (int i = 0; i < n; i++) {
+        if (i) strcat(line, ", ");
+        strcat(line, ds4_mcp_registry_tool_at(w->mcp, i)->wire_name);
+    }
+    strcat(line, "\n");
+    return line;
+}
+
 static char *agent_build_system_prompt_reminder(agent_worker *w) {
     char *tools = agent_build_tools_prompt();
     char *skills_line = agent_build_skills_reminder_line(w);
+    char *mcp_line = agent_build_mcp_reminder_line(w);
     const char *start = "\n\n[System prompt reminder follows.]\n";
     const char *end = "[End system prompt reminder.]\n\n";
     size_t len = strlen(start) + strlen(tools) +
-                 (skills_line ? strlen(skills_line) : 0) + strlen(end) + 1;
+                 (skills_line ? strlen(skills_line) : 0) +
+                 (mcp_line ? strlen(mcp_line) : 0) + strlen(end) + 1;
     char *out = xmalloc(len);
     out[0] = '\0';
     strcat(out, start);
     strcat(out, tools);
     if (skills_line) strcat(out, skills_line);
+    if (mcp_line) strcat(out, mcp_line);
     strcat(out, end);
     free(tools);
     free(skills_line);
+    free(mcp_line);
     return out;
 }
 
@@ -4026,6 +4051,11 @@ static void agent_append_dynamic_context(agent_worker *w, ds4_tokens *out) {
     if (skills_prompt) {
         ds4_tokenize_rendered_chat(w->engine, skills_prompt, out);
         free(skills_prompt);
+    }
+    char *m = ds4_mcp_tools_prompt_text(w->mcp);
+    if (m) {
+        ds4_tokenize_rendered_chat(w->engine, m, out);
+        free(m);
     }
 }
 
@@ -7330,6 +7360,28 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     }
 
     {
+        const ds4_mcp_tool *mcp_tool = ds4_mcp_registry_find(w->mcp, call->name);
+        if (mcp_tool) {
+            int argc = call->argc;
+            const char **names = xmalloc(sizeof(char *) * (size_t)(argc > 0 ? argc : 1));
+            const char **values = xmalloc(sizeof(char *) * (size_t)(argc > 0 ? argc : 1));
+            int *is_string = xmalloc(sizeof(int) * (size_t)(argc > 0 ? argc : 1));
+            for (int i = 0; i < argc; i++) {
+                names[i] = call->args[i].name;
+                values[i] = call->args[i].value;
+                is_string[i] = call->args[i].is_string;
+            }
+            char *args_json = ds4_mcp_args_to_json(names, values, is_string, argc);
+            free(names);
+            free(values);
+            free(is_string);
+            char *mcp_result = ds4_mcp_registry_call_tool(w->mcp, mcp_tool, args_json);
+            free(args_json);
+            return mcp_result;
+        }
+    }
+
+    {
         char header[256];
         snprintf(header, sizeof(header), "\n[tool:%s] unknown tool\n", call->name);
         agent_publish(w, header, strlen(header));
@@ -9588,13 +9640,17 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
     w->config = ds4_config_load(NULL, cfg_warn, sizeof(cfg_warn));
     char skills_warn[512] = {0};
     ds4_skills_scan(w->config, &w->skills, skills_warn, sizeof(skills_warn));
-    if (cfg_warn[0] || skills_warn[0]) {
+    char mcp_warn[512] = {0};
+    w->mcp = ds4_mcp_registry_create(w->config, NULL, mcp_warn, sizeof(mcp_warn));
+    if (cfg_warn[0] || skills_warn[0] || mcp_warn[0]) {
         if (cfg->non_interactive) {
             if (cfg_warn[0]) fputs(cfg_warn, stderr);
             if (skills_warn[0]) fputs(skills_warn, stderr);
+            if (mcp_warn[0]) fputs(mcp_warn, stderr);
         } else {
             if (cfg_warn[0]) agent_publishf_system_status(w, "%s", cfg_warn);
             if (skills_warn[0]) agent_publishf_system_status(w, "%s", skills_warn);
+            if (mcp_warn[0]) agent_publishf_system_status(w, "%s", mcp_warn);
         }
     }
     ds4_web_config web_cfg = {
@@ -9631,6 +9687,7 @@ static void agent_worker_free(agent_worker *w) {
     ds4_session_free(w->session);
     ds4_tokens_free(&w->transcript);
     ds4_skills_list_free(&w->skills);
+    ds4_mcp_registry_free(w->mcp);
     ds4_config_free(w->config);
     free(w->cache_dir);
     free(w->sysprompt_path);
