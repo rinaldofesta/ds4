@@ -588,7 +588,9 @@ static char *mcp_build_notification(const char *method) {
     return ds4_json_w_take(&w);
 }
 
-/* fork(); child dup2's the pipes onto stdin/stdout, stderr -> /dev/null,
+/* fork(); child setpgid(0,0) (so the whole process group -- including any
+ * grandchildren a wrapper like npx/uvx spawns -- can be killed atomically at
+ * shutdown), dup2's the pipes onto stdin/stdout, stderr -> /dev/null,
  * applies env via setenv, then execvp (no shell). Parent keeps the other
  * ends, CLOEXEC'd. Always leaves a proc entry behind (even on failure) so
  * ds4_mcp_registry_free has something consistent to iterate. */
@@ -611,6 +613,7 @@ static bool mcp_spawn(mcp_proc *proc, const mcp_cfgentry *cfg, char *warn, size_
         return false;
     }
     if (pid == 0) {
+        setpgid(0, 0);
         dup2(p_in[0], STDIN_FILENO);
         dup2(p_out[1], STDOUT_FILENO);
         int devnull = open("/dev/null", O_WRONLY);
@@ -625,6 +628,18 @@ static bool mcp_spawn(mcp_proc *proc, const mcp_cfgentry *cfg, char *warn, size_
         execvp(cfg->argv[0], cfg->argv);
         _exit(127);
     }
+
+    /* Both sides call setpgid on the child: the child calls it on itself
+     * above so the group exists even if it execs before the parent runs,
+     * and the parent calls it here so the group exists even if shutdown's
+     * kill(-pid, ...) (see ds4_mcp_registry_free) runs before the child gets
+     * scheduled at all. Whichever call wins the race sets the same thing
+     * (the child's pgid to its own pid), so this is idempotent, not a
+     * conflict; the parent's call failing (ESRCH if the child has already
+     * exited, EACCES if it already exec'd a set-id program) is fine to
+     * ignore -- the child's own call already covers those cases. Mirrors
+     * ds4_hooks' identical fix for the same race (commit 26c73d0). */
+    setpgid(pid, pid);
 
     close(p_in[0]);
     close(p_out[1]);
@@ -788,6 +803,25 @@ static void mcp_discover_one(ds4_mcp_registry *reg, mcp_proc *p, const char *ser
     free(cursor);
 }
 
+/* Sorts reg->tools by wire_name once all servers have finished discovery, so
+ * the rendered prompt block (and every other listing that walks
+ * reg->tools[] by index, e.g. agent_build_mcp_reminder_line) is deterministic
+ * regardless of the order servers were configured in or the order any one
+ * server's tools/list response happened to use -- the content-addressed
+ * sysprompt cache keys on sha1 of that rendered text, so a shuffled order
+ * would silently defeat the cache on every restart. Mirrors ds4_skills'
+ * per-root catalog sort for the same reason (commit a483384). Wire names are
+ * unique (duplicate wire names are dropped at intake, see
+ * mcp_process_tool_entry), so strcmp on wire_name is a total order -- a
+ * single sort over the whole array is safe (nothing downstream relies on
+ * per-server contiguity: ds4_mcp_registry_find looks up by wire_name,
+ * ds4_mcp_registry_call_tool routes by tool->server_name not index, and
+ * ds4_mcp_registry_free/tool_count/tool_at all just walk the full array). */
+static int mcp_tool_cmp(const void *a, const void *b) {
+    const ds4_mcp_tool *ta = a, *tb = b;
+    return strcmp(ta->wire_name, tb->wire_name);
+}
+
 /* ---- public API ---- */
 
 ds4_mcp_registry *ds4_mcp_registry_create(const ds4_config *cfg, const ds4_mcp_opts *opts,
@@ -820,6 +854,9 @@ ds4_mcp_registry *ds4_mcp_registry_create(const ds4_config *cfg, const ds4_mcp_o
         mcp_discover_one(reg, p, ce->name, warn, warn_len);
     }
 
+    if (reg->tool_count > 0)
+        qsort(reg->tools, (size_t)reg->tool_count, sizeof(reg->tools[0]), mcp_tool_cmp);
+
     mcp_cfgentry_list_free(&configs);
     return reg;
 }
@@ -827,8 +864,12 @@ ds4_mcp_registry *ds4_mcp_registry_create(const ds4_config *cfg, const ds4_mcp_o
 void ds4_mcp_registry_free(ds4_mcp_registry *reg) {
     if (!reg) return;
 
+    /* Negative pid = "the whole process group" (see mcp_spawn's setpgid
+     * pair), so a wrapper like npx/uvx and whatever real server process it
+     * execs/forks are signaled together -- killing just the wrapper's bare
+     * pid would leave the actual server running as an orphaned grandchild. */
     for (int i = 0; i < reg->proc_count; i++)
-        if (reg->procs[i].pid > 0) kill(reg->procs[i].pid, SIGTERM);
+        if (reg->procs[i].pid > 0) kill(-reg->procs[i].pid, SIGTERM);
 
     struct timespec step = { 0, 10 * 1000 * 1000 }; /* 10ms */
     for (int iter = 0; iter < 30; iter++) {
@@ -847,7 +888,7 @@ void ds4_mcp_registry_free(ds4_mcp_registry *reg) {
     for (int i = 0; i < reg->proc_count; i++) {
         mcp_proc *p = &reg->procs[i];
         if (p->pid > 0) {
-            kill(p->pid, SIGKILL);
+            kill(-p->pid, SIGKILL);
             waitpid(p->pid, NULL, 0);
             p->pid = -1;
         }
@@ -1201,6 +1242,25 @@ static void test_normal(void) {
         MCP_TEST_ASSERT(reg != NULL);
         if (reg) {
             MCP_TEST_ASSERT(ds4_mcp_registry_tool_count(reg) == 2);
+            /* The mock's tools/list response order is echo, add -- but the
+             * registry sorts tools by wire_name after discovery so the
+             * rendered prompt block is deterministic across runs regardless
+             * of server-side ordering (see ds4_mcp_registry_create), so the
+             * registry order must be add, echo (sorted), not server order. */
+            const ds4_mcp_tool *t0 = ds4_mcp_registry_tool_at(reg, 0);
+            const ds4_mcp_tool *t1 = ds4_mcp_registry_tool_at(reg, 1);
+            MCP_TEST_ASSERT(t0 != NULL && !strcmp(t0->wire_name, "mcp__mock__add"));
+            MCP_TEST_ASSERT(t1 != NULL && !strcmp(t1->wire_name, "mcp__mock__echo"));
+
+            char *prompt = ds4_mcp_tools_prompt_text(reg);
+            MCP_TEST_ASSERT(prompt != NULL);
+            if (prompt) {
+                char *add_pos = strstr(prompt, "mcp__mock__add");
+                char *echo_pos = strstr(prompt, "mcp__mock__echo");
+                MCP_TEST_ASSERT(add_pos != NULL && echo_pos != NULL && add_pos < echo_pos);
+                free(prompt);
+            }
+
             const ds4_mcp_tool *echo = ds4_mcp_registry_find(reg, "mcp__mock__echo");
             const ds4_mcp_tool *add = ds4_mcp_registry_find(reg, "mcp__mock__add");
             MCP_TEST_ASSERT(echo != NULL);
@@ -1582,6 +1642,117 @@ static void test_plugin_mcp_json_spawns_mock(void) {
     free(proj); free(proj_ds4); free(plugin_dir);
 }
 
+/* Regression test for the wrapper-launched-server orphan-grandchild bug:
+ * mcp.json's "command" is "/bin/sh", whose args exec the mock (in "linger"
+ * mode) as a grandchild of this test process -- one level below the
+ * ds4_mcp-spawned direct child (the shell). The trailing "; true" defeats
+ * the shell's exec-tail-call optimization (some /bin/sh implementations
+ * replace themselves via exec when the command is the last thing in the
+ * script, which would collapse the shell and mock into a single process
+ * and defeat the point of this test), forcing the shell to fork a real
+ * subprocess for the mock. Not backgrounded (no trailing "&") because
+ * backgrounding would detach the mock's stdin from /dev/null and break the
+ * initialize/tools-list handshake this test depends on to prove the pipes
+ * still flow correctly through the wrapper.
+ *
+ * "linger" mode (not "normal") matters here: after ds4_mcp_registry_free
+ * gives up on the direct child (the shell) and stops waiting, it
+ * unconditionally closes its own copy of the stdin pipe's write end. A
+ * server that just blocks in a stdin read loop (like "normal" mode) would
+ * then exit on its own via ordinary EOF -- since the shell never held a
+ * second reference to that write end open, closing it is sufficient
+ * regardless of which pid actually got signaled, which would make this test
+ * pass even against the bug (a false negative). "linger" instead stops
+ * touching stdin entirely after listing tools and blocks in pause(), so it
+ * only dies from an actual signal delivered to it directly -- which only
+ * happens if that signal targets the whole process group, not just the
+ * wrapper's bare pid. Confirmed empirically: this test fails (RED) against
+ * the pre-fix bare-pid kill and passes (GREEN) once shutdown targets
+ * -pid instead. */
+static void test_grandchild_process_group_killed(void) {
+    char tmpl[] = "/tmp/ds4_mcp_pg_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    MCP_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+    fx = mcp_test_strdup(fx);
+
+    char *proj = mcp_test_join(fx, "proj");
+    char *ds4dir = mcp_test_join(proj, ".ds4");
+    mcp_test_mkdir_p(ds4dir);
+
+    char mockpath[PATH_MAX];
+    if (!realpath("tests/mock_mcp_server", mockpath)) {
+        fprintf(stderr, "mcp test fixture: could not resolve tests/mock_mcp_server\n");
+        mockpath[0] = '\0';
+    }
+    char *pidfile = mcp_test_join(fx, "grandchild.pid");
+
+    char *mcpjson_path = mcp_test_join(ds4dir, "mcp.json");
+    char content[PATH_MAX * 2 + 256];
+    snprintf(content, sizeof(content),
+             "{\"mcpServers\":{\"mock\":{\"command\":\"/bin/sh\",\"args\":[\"-c\","
+             "\"MOCK_PIDFILE=%s %s linger; true\"]}}}",
+             pidfile, mockpath);
+    mcp_test_write_file(mcpjson_path, content);
+    free(mcpjson_path);
+
+    char *home = mcp_test_join(fx, "home");
+    mcp_test_mkdir_p(home);
+    char *saved_home;
+    mcp_test_setenv_home(home, &saved_home);
+
+    ds4_config *cfg = ds4_config_load(proj, NULL, 0);
+    MCP_TEST_ASSERT(cfg != NULL);
+    if (cfg) {
+        char warn[512] = {0};
+        ds4_mcp_registry *reg = ds4_mcp_registry_create(cfg, NULL, warn, sizeof(warn));
+        MCP_TEST_ASSERT(reg != NULL);
+        if (reg) {
+            /* Proves the pipes flow through the shell wrapper (handshake +
+             * tools/list both round-tripped through it to reach the mock). */
+            MCP_TEST_ASSERT(ds4_mcp_registry_tool_count(reg) == 2);
+
+            int gc_pid = -1;
+            for (int i = 0; i < 40 && gc_pid <= 0; i++) {
+                FILE *pf = fopen(pidfile, "r");
+                if (pf) {
+                    if (fscanf(pf, "%d", &gc_pid) != 1) gc_pid = -1;
+                    fclose(pf);
+                }
+                if (gc_pid <= 0) {
+                    struct timespec nap = { 0, 50 * 1000 * 1000 }; /* 50ms poll */
+                    nanosleep(&nap, NULL);
+                }
+            }
+            MCP_TEST_ASSERT(gc_pid > 0);
+
+            ds4_mcp_registry_free(reg);
+
+            if (gc_pid > 0) {
+                bool dead = false;
+                for (int i = 0; i < 40 && !dead; i++) {
+                    if (kill((pid_t)gc_pid, 0) == -1 && errno == ESRCH) { dead = true; break; }
+                    struct timespec nap = { 0, 50 * 1000 * 1000 }; /* 50ms poll, <=2s total */
+                    nanosleep(&nap, NULL);
+                }
+                MCP_TEST_ASSERT(dead);
+            }
+        } else {
+            ds4_mcp_registry_free(reg);
+        }
+    }
+    ds4_config_free(cfg);
+
+    mcp_test_restore_home(saved_home);
+    free(home);
+    unlink(pidfile);
+    free(pidfile);
+    mcp_test_rmtree(fx);
+    free(fx);
+    free(proj);
+    free(ds4dir);
+}
+
 int ds4_mcp_unit_tests_run(void) {
     test_normal();
     test_args_to_json();
@@ -1596,6 +1767,7 @@ int ds4_mcp_unit_tests_run(void) {
     test_golden_prompt();
     test_registry_free_reaps();
     test_plugin_mcp_json_spawns_mock();
+    test_grandchild_process_group_killed();
     return mcp_test_failures;
 }
 #endif

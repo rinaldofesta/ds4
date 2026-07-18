@@ -201,6 +201,20 @@ static void respond_tools_call_generic(int id, const char *name, const char *arg
 int main(int argc, char **argv) {
     const char *mode = (argc > 1) ? argv[1] : "normal";
 
+    /* Grandchild-reap regression test support: when a wrapper shell (e.g.
+     * "/bin/sh -c '... mock_mcp_server normal; true'") execs this binary, it
+     * runs as a grandchild of the test harness rather than its direct
+     * child. Writing our own pid out lets that test discover the
+     * grandchild's pid without depending on process-tree introspection. */
+    const char *pidfile = getenv("MOCK_PIDFILE");
+    if (pidfile) {
+        FILE *pf = fopen(pidfile, "w");
+        if (pf) {
+            fprintf(pf, "%d", (int)getpid());
+            fclose(pf);
+        }
+    }
+
     if (!strcmp(mode, "exit-early")) return 0;
 
     if (!strcmp(mode, "garbage")) {
@@ -235,6 +249,18 @@ int main(int argc, char **argv) {
                 respond_tools_list_die_after_list(id);
                 free(line);
                 return 0;
+            } else if (!strcmp(mode, "linger")) {
+                /* Grandchild-reap regression test support: after listing
+                 * tools, stop reading stdin entirely and block in pause()
+                 * instead of looping back to read_line(). This simulates a
+                 * real server that does its own thing (e.g. background
+                 * work) independent of the request pipe, so closing the
+                 * pipe's write end alone must NOT be enough to end it --
+                 * only an actual signal (correctly targeting its whole
+                 * process group, not just a wrapper's bare pid) can. */
+                respond_tools_list_normal(id);
+                free(line);
+                for (;;) pause();
             } else {
                 respond_tools_list_normal(id); /* normal, chatty */
             }
