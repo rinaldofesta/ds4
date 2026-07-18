@@ -9,6 +9,7 @@
 #include "ds4_mcp.h"
 #include "ds4_commands.h"
 #include "ds4_hooks.h"
+#include "ds4_permissions.h"
 #include "linenoise.h"
 
 #include <errno.h>
@@ -71,6 +72,7 @@ typedef struct {
     agent_generation_options gen;
     const char *chdir_path;
     bool non_interactive;
+    bool auto_approve;
 } agent_config;
 
 typedef enum {
@@ -111,6 +113,7 @@ typedef struct {
     ds4_skill_list skills;
     ds4_mcp_registry *mcp;
     ds4_hooks *hooks;
+    ds4_permissions *perms;
     char *sysprompt_path;
     char session_sha[41];
     char *session_title;
@@ -145,6 +148,10 @@ typedef struct {
     bool web_approval_result;
     char web_approval_message[256];
     char web_approval_error[160];
+    bool perm_approval_pending;
+    bool perm_approval_answered;
+    bool perm_approval_result;
+    char perm_approval_question[512];
     bool queued_user_drain_pending;
     bool queued_user_drain_answered;
     char *queued_user_drain_text;
@@ -603,6 +610,8 @@ static agent_config parse_options(int argc, char **argv) {
             c.gen.prompt = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--non-interactive")) {
             c.non_interactive = true;
+        } else if (!strcmp(arg, "--auto-approve")) {
+            c.auto_approve = true;
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--trace")) {
@@ -4211,6 +4220,59 @@ static void worker_answer_web_approval(agent_worker *w, bool allow,
     pthread_mutex_unlock(&w->mu);
 }
 
+/* Permission-gate approval relay: a PARALLEL pattern to the web-approval one
+ * just above (agent_web_confirm / worker_take_web_approval_request /
+ * worker_answer_web_approval), for the generic "Allow <tool>: <subject>?"
+ * question the permission gate (see agent_execute_tool_call) asks when a
+ * confirm-gated tool has no matching allow rule and the run is interactive.
+ * Deliberately not a shared/parameterized helper with the web relay -- same
+ * upstream-diff philosophy as the rest of this codebase: this is ours to own,
+ * a small duplicated pattern rather than a refactor of code that already
+ * shipped. Default/EOF answer is deny, same as every other y/n prompt in this
+ * file (agent_prompt_yes_no with no timeout options). */
+static bool agent_perm_confirm(agent_worker *w, const char *tool_name,
+                               const char *subject) {
+    pthread_mutex_lock(&w->mu);
+    w->perm_approval_pending = true;
+    w->perm_approval_answered = false;
+    w->perm_approval_result = false;
+    char subj_trunc[121];
+    snprintf(subj_trunc, sizeof(subj_trunc), "%.120s", subject ? subject : "");
+    snprintf(w->perm_approval_question, sizeof(w->perm_approval_question),
+             "Allow %s: %s? [y/N] ", tool_name ? tool_name : "", subj_trunc);
+    agent_wake_locked(w);
+    while (!w->stop && !w->interrupt && !w->perm_approval_answered)
+        pthread_cond_wait(&w->cond, &w->mu);
+    bool ok = w->perm_approval_result;
+    if (!w->perm_approval_answered && (w->stop || w->interrupt)) {
+        ok = false;
+        w->perm_approval_pending = false;
+    }
+    pthread_mutex_unlock(&w->mu);
+    return ok;
+}
+
+static bool worker_take_perm_approval_request(agent_worker *w,
+                                              char *message, size_t message_len) {
+    pthread_mutex_lock(&w->mu);
+    bool pending = w->perm_approval_pending;
+    if (pending) {
+        snprintf(message, message_len, "%s", w->perm_approval_question);
+        w->perm_approval_pending = false;
+    }
+    pthread_mutex_unlock(&w->mu);
+    return pending;
+}
+
+static void worker_answer_perm_approval(agent_worker *w, bool allow) {
+    pthread_mutex_lock(&w->mu);
+    w->perm_approval_result = allow;
+    w->perm_approval_answered = true;
+    pthread_cond_signal(&w->cond);
+    agent_wake_locked(w);
+    pthread_mutex_unlock(&w->mu);
+}
+
 /* When a model turn finishes with a tool call, queued user messages should not
  * preempt that tool.  The worker asks the UI thread for the queue contents only
  * after the tool result is appended, so the next model input can contain both
@@ -6307,6 +6369,7 @@ static void test_agent_edit_upto_requires_tail_after_newline_strip(void) {
 /* Forward declared: defined later in the file (tool dispatch), needed here so
  * this test can drive a "skill" call through the real dispatch chain. */
 static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *call);
+static const char *agent_tool_call_subject(const agent_tool_call *call);
 
 static void test_agent_tool_skill_dispatch(void) {
     char tmpl[] = "/tmp/ds4_agent_skill_dispatch_test.XXXXXX";
@@ -6494,12 +6557,154 @@ static void test_agent_tool_hook_wrapper(void) {
     rmdir(fx);
 }
 
+/* Drives agent_tool_call_subject() -- the permission gate's subject
+ * extraction -- directly with hand-built calls: command arg present (wins
+ * over path/first-arg), no command but path present, neither command nor
+ * path (falls back to the first arg's value), and zero args at all ("").  */
+static void test_agent_tool_call_subject_extraction(void) {
+    {
+        agent_tool_call call = {0};
+        call.name = xstrdup("bash");
+        agent_tool_call_add_arg(&call, "path", "/should/not/win", strlen("/should/not/win"), true);
+        agent_tool_call_add_arg(&call, "command", "make test", strlen("make test"), true);
+        AGENT_TEST_ASSERT(!strcmp(agent_tool_call_subject(&call), "make test"));
+        agent_tool_call_free(&call);
+    }
+    {
+        agent_tool_call call = {0};
+        call.name = xstrdup("write");
+        agent_tool_call_add_arg(&call, "path", "notes.md", strlen("notes.md"), true);
+        AGENT_TEST_ASSERT(!strcmp(agent_tool_call_subject(&call), "notes.md"));
+        agent_tool_call_free(&call);
+    }
+    {
+        agent_tool_call call = {0};
+        call.name = xstrdup("skill");
+        agent_tool_call_add_arg(&call, "name", "the-skill", strlen("the-skill"), true);
+        AGENT_TEST_ASSERT(!strcmp(agent_tool_call_subject(&call), "the-skill"));
+        agent_tool_call_free(&call);
+    }
+    {
+        agent_tool_call call = {0};
+        call.name = xstrdup("bash_status");
+        AGENT_TEST_ASSERT(!strcmp(agent_tool_call_subject(&call), ""));
+        agent_tool_call_free(&call);
+    }
+}
+
+/* Drives the permission gate inside agent_execute_tool_call end to end: a
+ * real ds4_permissions handle (loaded from an on-disk settings.json) that
+ * confirm-gates "skill" with no allow rule must stop agent_tool_skill from
+ * ever running while --non-interactive and --auto-approve=0 (the CLI
+ * default): the model-visible result is the "requires permission" error, not
+ * the skill body. --auto-approve=1 treats the same call as allowed and runs
+ * it normally. With w->perms NULL, the call is the byte-identical Task-6
+ * result regardless of auto_approve. See test_agent_tool_hook_wrapper just
+ * above for why this test gives the worker a real agent_config rather than a
+ * truly zeroed one. */
+static void test_agent_permission_gate(void) {
+    char tmpl[] = "/tmp/ds4_agent_perm_gate_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    AGENT_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    char md_path[PATH_MAX];
+    snprintf(md_path, sizeof(md_path), "%s/SKILL.md", fx);
+    FILE *fp = fopen(md_path, "wb");
+    AGENT_TEST_ASSERT(fp != NULL);
+    if (fp) {
+        fputs("---\nname: the-skill\ndescription: Test skill.\n---\nDo the thing.\n", fp);
+        fclose(fp);
+    }
+
+    char ds4_dir[PATH_MAX], settings_path[PATH_MAX];
+    snprintf(ds4_dir, sizeof(ds4_dir), "%s/.ds4", fx);
+    mkdir(ds4_dir, 0700);
+    snprintf(settings_path, sizeof(settings_path), "%s/settings.json", ds4_dir);
+    FILE *sf = fopen(settings_path, "wb");
+    AGENT_TEST_ASSERT(sf != NULL);
+    if (sf) {
+        fputs("{\"permissions\":{\"confirm\":[\"skill\"]}}", sf);
+        fclose(sf);
+    }
+
+    /* Isolate HOME so a real ~/.ds4/settings.json on the test machine can't
+     * leak an unrelated "permissions" key in (moot either way, since the
+     * project key wins wholesale, but keeps the fixture self-contained). */
+    const char *home_save_val = getenv("HOME");
+    char *home_save = home_save_val ? xstrdup(home_save_val) : NULL;
+    setenv("HOME", fx, 1);
+
+    char warn[256] = {0};
+    ds4_config *cfg = ds4_config_load(fx, warn, sizeof(warn));
+    AGENT_TEST_ASSERT(cfg != NULL);
+    ds4_permissions *perms = ds4_permissions_load(cfg, warn, sizeof(warn));
+    AGENT_TEST_ASSERT(perms != NULL);
+
+    if (home_save) { setenv("HOME", home_save, 1); free(home_save); }
+    else unsetenv("HOME");
+
+    agent_config acfg = {0};
+    acfg.non_interactive = true;
+
+    agent_worker w = {0};
+    w.cfg = &acfg;
+    w.skills.v = xmalloc(sizeof(ds4_skill_meta));
+    w.skills.len = 1;
+    w.skills.cap = 1;
+    w.skills.v[0].name = xstrdup("the-skill");
+    w.skills.v[0].description = xstrdup("Test skill.");
+    w.skills.v[0].dir = xstrdup(fx);
+    w.perms = perms;
+
+    agent_tool_call call = {0};
+    call.name = xstrdup("skill");
+    agent_tool_call_add_arg(&call, "name", "the-skill", strlen("the-skill"), true);
+
+    /* non_interactive, auto_approve=0: gated with no allow match -> denied
+     * without ever running the skill. */
+    char *denied_result = agent_execute_tool_call(&w, &call);
+    AGENT_TEST_ASSERT(denied_result != NULL);
+    if (denied_result) {
+        AGENT_TEST_ASSERT(strstr(denied_result, "requires permission") != NULL);
+        AGENT_TEST_ASSERT(strstr(denied_result, "Do the thing.") == NULL);
+    }
+    free(denied_result);
+
+    /* auto_approve=1: treated as allow, executes normally. */
+    acfg.auto_approve = true;
+    char *approved_result = agent_execute_tool_call(&w, &call);
+    AGENT_TEST_ASSERT(approved_result != NULL);
+    if (approved_result) AGENT_TEST_ASSERT(strstr(approved_result, "Do the thing.") != NULL);
+    free(approved_result);
+    acfg.auto_approve = false;
+
+    /* w->perms NULL: the byte-identical fast path, normal result regardless
+     * of non_interactive/auto_approve. */
+    w.perms = NULL;
+    char *normal_result = agent_execute_tool_call(&w, &call);
+    AGENT_TEST_ASSERT(normal_result != NULL);
+    if (normal_result) AGENT_TEST_ASSERT(strstr(normal_result, "Do the thing.") != NULL);
+    free(normal_result);
+
+    agent_tool_call_free(&call);
+    ds4_permissions_free(perms);
+    ds4_config_free(cfg);
+    ds4_skills_list_free(&w.skills);
+    unlink(settings_path);
+    rmdir(ds4_dir);
+    unlink(md_path);
+    rmdir(fx);
+}
+
 static void ds4_agent_unit_tests_run(void) {
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
     test_agent_tool_skill_dispatch();
     test_agent_slash_command_known_file_commands();
     test_agent_tool_hook_wrapper();
+    test_agent_tool_call_subject_extraction();
+    test_agent_permission_gate();
 }
 #endif
 
@@ -7565,16 +7770,38 @@ static char *agent_execute_tool_call_inner(agent_worker *w, const agent_tool_cal
     }
 }
 
-/* Dispatch wrapper around agent_execute_tool_call_inner: when no hooks are
- * configured (the overwhelmingly common case), this forwards directly with
- * zero extra work and no observable difference -- byte-identical dispatch.
- * When hooks are configured, it wraps the inner call with PreToolUse /
- * PostToolUse shell hooks (see ds4_hooks.h for the schema and payload
- * shapes). This is the function every call site actually calls; the name
- * and signature match what used to be agent_execute_tool_call_inner's, so
- * no caller needed to change. */
+/* Subject extraction for the permission gate (ds4_permissions.h): the value
+ * of the arg named "command" if present, else the arg named "path", else the
+ * first arg's value, else "". Covers bash -> command, write/edit/read ->
+ * path, skill -> name, and MCP tools -> first arg. */
+static const char *agent_tool_call_subject(const agent_tool_call *call) {
+    const char *subject = agent_tool_arg_value(call, "command");
+    if (!subject) subject = agent_tool_arg_value(call, "path");
+    if (!subject) {
+        subject = (call->argc > 0) ?
+            (call->args[0].value ? call->args[0].value : "") : "";
+    }
+    return subject;
+}
+
+/* Dispatch wrapper around agent_execute_tool_call_inner: when neither hooks
+ * nor permissions are configured (the overwhelmingly common case), this
+ * forwards directly with zero extra work and no observable difference --
+ * byte-identical dispatch. When hooks are configured, it wraps the inner
+ * call with PreToolUse/PostToolUse shell hooks (see ds4_hooks.h for the
+ * schema and payload shapes). When permissions are configured, after
+ * PreToolUse hooks pass and before the inner dispatch runs, it gates
+ * confirm-listed tools through ds4_permissions_check (see ds4_permissions.h
+ * for the settings.json schema): an ALLOW decision (no permissions handle,
+ * tool not in "confirm", or a matching "allow" rule) proceeds straight
+ * through; an ASK decision either auto-approves (--auto-approve), refuses
+ * outright (--non-interactive, since there's no one to ask), or relays a
+ * y/N question to the UI thread and blocks the worker until answered (see
+ * agent_perm_confirm above). This is the function every call site actually
+ * calls; the name and signature match what used to be
+ * agent_execute_tool_call_inner's, so no caller needed to change. */
 static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *call) {
-    if (!w->hooks) return agent_execute_tool_call_inner(w, call);
+    if (!w->hooks && !w->perms) return agent_execute_tool_call_inner(w, call);
 
     const char *tool_name = call->name ? call->name : "";
 
@@ -7619,6 +7846,38 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
         return agent_buf_take(&out);
     }
     ds4_hook_result_free(&pre);
+
+    /* Permission gate (ds4_permissions.h): a pure decision when w->perms is
+     * NULL or the tool isn't confirm-listed (ALLOW, the common case) falls
+     * straight through with no observable difference. An ASK decision is
+     * resolved here, before the inner dispatch ever runs. */
+    const char *subject = agent_tool_call_subject(call);
+    if (ds4_permissions_check(w->perms, tool_name, subject) == DS4_PERM_ASK &&
+        !w->cfg->auto_approve)
+    {
+        bool allowed;
+        if (w->cfg->non_interactive) {
+            allowed = false;
+        } else {
+            allowed = agent_perm_confirm(w, tool_name, subject);
+        }
+        if (!allowed) {
+            agent_buf out = {0};
+            if (w->cfg->non_interactive) {
+                agent_buf_puts(&out, "Tool error: '");
+                agent_buf_puts(&out, tool_name);
+                agent_buf_puts(&out,
+                    "' requires permission (add a permissions.allow rule in "
+                    ".ds4/settings.json or run with --auto-approve)\n");
+            } else {
+                agent_buf_puts(&out, "Tool error: user denied permission for '");
+                agent_buf_puts(&out, tool_name);
+                agent_buf_puts(&out, "'\n");
+            }
+            free(tool_input_json);
+            return agent_buf_take(&out);
+        }
+    }
 
     char *result = agent_execute_tool_call_inner(w, call);
 
@@ -9928,19 +10187,23 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
     w->mcp = ds4_mcp_registry_create(w->config, NULL, mcp_warn, sizeof(mcp_warn));
     char hooks_warn[512] = {0};
     w->hooks = ds4_hooks_load(w->config, hooks_warn, sizeof(hooks_warn));
-    if (cfg_warn[0] || commands_warn[0] || skills_warn[0] || mcp_warn[0] || hooks_warn[0]) {
+    char perms_warn[512] = {0};
+    w->perms = ds4_permissions_load(w->config, perms_warn, sizeof(perms_warn));
+    if (cfg_warn[0] || commands_warn[0] || skills_warn[0] || mcp_warn[0] || hooks_warn[0] || perms_warn[0]) {
         if (cfg->non_interactive) {
             if (cfg_warn[0]) fputs(cfg_warn, stderr);
             if (commands_warn[0]) fputs(commands_warn, stderr);
             if (skills_warn[0]) fputs(skills_warn, stderr);
             if (mcp_warn[0]) fputs(mcp_warn, stderr);
             if (hooks_warn[0]) fputs(hooks_warn, stderr);
+            if (perms_warn[0]) fputs(perms_warn, stderr);
         } else {
             if (cfg_warn[0]) agent_publishf_system_status(w, "%s", cfg_warn);
             if (commands_warn[0]) agent_publishf_system_status(w, "%s", commands_warn);
             if (skills_warn[0]) agent_publishf_system_status(w, "%s", skills_warn);
             if (mcp_warn[0]) agent_publishf_system_status(w, "%s", mcp_warn);
             if (hooks_warn[0]) agent_publishf_system_status(w, "%s", hooks_warn);
+            if (perms_warn[0]) agent_publishf_system_status(w, "%s", perms_warn);
         }
     }
     ds4_web_config web_cfg = {
@@ -9980,6 +10243,7 @@ static void agent_worker_free(agent_worker *w) {
     ds4_commands_list_free(&g_agent_commands);
     ds4_mcp_registry_free(w->mcp);
     ds4_hooks_free(w->hooks);
+    ds4_permissions_free(w->perms);
     ds4_config_free(w->config);
     free(w->cache_dir);
     free(w->sysprompt_path);
@@ -10441,6 +10705,26 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                                                 &approval_timed_out);
             worker_answer_web_approval(&worker, allow,
                 approval_timed_out ? "Chrome browser start approval timed out" : NULL);
+            worker_get_status(&worker, &st);
+            build_prompt_text(&st, prompt, sizeof(prompt));
+            int restart_cols = editor.edit.cols > 0 ? (int)editor.edit.cols : 80;
+            build_footer_text(&st, &queue, restart_cols, statusline, sizeof(statusline));
+            editor_start(&editor, prompt, statusline, saved_input);
+            free(saved_input);
+            continue;
+        }
+
+        char perm_approval_msg[512];
+        if (worker_take_perm_approval_request(&worker, perm_approval_msg,
+                                              sizeof(perm_approval_msg)))
+        {
+            char *saved_input = NULL;
+            if (editor.active && editor.edit.buf && editor.edit.len)
+                saved_input = xstrndup(editor.edit.buf, editor.edit.len);
+            editor_stop(&editor);
+            editor_restore_terminal_layout(&editor);
+            bool allow = agent_prompt_yes_no(perm_approval_msg);
+            worker_answer_perm_approval(&worker, allow);
             worker_get_status(&worker, &st);
             build_prompt_text(&st, prompt, sizeof(prompt));
             int restart_cols = editor.edit.cols > 0 ? (int)editor.edit.cols : 80;
