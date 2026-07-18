@@ -8,6 +8,7 @@
 #include "ds4_skills.h"
 #include "ds4_mcp.h"
 #include "ds4_commands.h"
+#include "ds4_hooks.h"
 #include "linenoise.h"
 
 #include <errno.h>
@@ -109,6 +110,7 @@ typedef struct {
     ds4_config *config;
     ds4_skill_list skills;
     ds4_mcp_registry *mcp;
+    ds4_hooks *hooks;
     char *sysprompt_path;
     char session_sha[41];
     char *session_title;
@@ -6384,11 +6386,120 @@ static void test_agent_slash_command_known_file_commands(void) {
     AGENT_TEST_ASSERT(!agent_slash_command_known("/mycmd"));
 }
 
+/* Drives the agent_execute_tool_call dispatch wrapper end to end: a real
+ * ds4_hooks handle (loaded from an on-disk settings.json, via the fixture
+ * scripts every ds4_hooks_test group also uses) that blocks matcher "skill"
+ * must stop agent_tool_skill from ever running; with w->hooks NULL the very
+ * same call must fall through to the byte-identical Task-3 result.
+ *
+ * agent_publish_system_status derefs w->cfg unconditionally
+ * (w->cfg->non_interactive), so a bare zeroed agent_worker is NOT safe to
+ * pass to it as-is: w.cfg would be NULL there. Separately, raw agent_publish
+ * on a truly zeroed worker doesn't crash on this platform (pthread_mutex_lock
+ * on a zeroed pthread_mutex_t returns EINVAL rather than hanging, confirmed
+ * empirically), but agent_wake_locked would then write a stray byte to
+ * w.wake_fd[1], which defaults to 0 (stdin) on a zeroed worker -- not
+ * something to rely on. This test sidesteps both hazards the same way
+ * production code already does: it gives the worker a real (non-NULL)
+ * agent_config with non_interactive=true, so agent_publish_system_status's
+ * existing guard returns immediately, before ever touching w.mu/w.wake_fd. */
+static void test_agent_tool_hook_wrapper(void) {
+    char tmpl[] = "/tmp/ds4_agent_hook_wrapper_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    AGENT_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    char md_path[PATH_MAX];
+    snprintf(md_path, sizeof(md_path), "%s/SKILL.md", fx);
+    FILE *fp = fopen(md_path, "wb");
+    AGENT_TEST_ASSERT(fp != NULL);
+    if (fp) {
+        fputs("---\nname: the-skill\ndescription: Test skill.\n---\nDo the thing.\n", fp);
+        fclose(fp);
+    }
+
+    char block_path[PATH_MAX];
+    bool have_block_path = realpath("tests/fixtures/hook_block.sh", block_path) != NULL;
+    AGENT_TEST_ASSERT(have_block_path);
+    if (have_block_path) chmod(block_path, 0755);
+
+    char ds4_dir[PATH_MAX], settings_path[PATH_MAX];
+    snprintf(ds4_dir, sizeof(ds4_dir), "%s/.ds4", fx);
+    mkdir(ds4_dir, 0700);
+    snprintf(settings_path, sizeof(settings_path), "%s/settings.json", ds4_dir);
+    FILE *sf = fopen(settings_path, "wb");
+    AGENT_TEST_ASSERT(sf != NULL);
+    if (sf) {
+        fprintf(sf, "{\"hooks\":{\"PreToolUse\":[{\"matcher\":\"skill\",\"command\":\"%s\"}]}}",
+                have_block_path ? block_path : "true");
+        fclose(sf);
+    }
+
+    /* Isolate HOME so a real ~/.ds4/settings.json on the test machine can't
+     * leak an unrelated "hooks" key in (moot either way, since the project
+     * key wins wholesale, but keeps the fixture self-contained). */
+    const char *home_save_val = getenv("HOME");
+    char *home_save = home_save_val ? xstrdup(home_save_val) : NULL;
+    setenv("HOME", fx, 1);
+
+    char warn[256] = {0};
+    ds4_config *cfg = ds4_config_load(fx, warn, sizeof(warn));
+    AGENT_TEST_ASSERT(cfg != NULL);
+    ds4_hooks *hooks = ds4_hooks_load(cfg, warn, sizeof(warn));
+    AGENT_TEST_ASSERT(hooks != NULL);
+
+    if (home_save) { setenv("HOME", home_save, 1); free(home_save); }
+    else unsetenv("HOME");
+
+    agent_config acfg = {0};
+    acfg.non_interactive = true;
+
+    agent_worker w = {0};
+    w.cfg = &acfg;
+    w.skills.v = xmalloc(sizeof(ds4_skill_meta));
+    w.skills.len = 1;
+    w.skills.cap = 1;
+    w.skills.v[0].name = xstrdup("the-skill");
+    w.skills.v[0].description = xstrdup("Test skill.");
+    w.skills.v[0].dir = xstrdup(fx);
+    w.hooks = hooks;
+
+    agent_tool_call call = {0};
+    call.name = xstrdup("skill");
+    agent_tool_call_add_arg(&call, "name", "the-skill", strlen("the-skill"), true);
+
+    char *blocked_result = agent_execute_tool_call(&w, &call);
+    AGENT_TEST_ASSERT(blocked_result != NULL);
+    if (blocked_result) {
+        AGENT_TEST_ASSERT(strstr(blocked_result, "blocked") != NULL);
+        AGENT_TEST_ASSERT(strstr(blocked_result, "Do the thing.") == NULL);
+    }
+    free(blocked_result);
+
+    /* Same call, w->hooks NULL: the byte-identical fast path, normal Task-3
+     * result (the skill body sentinel is present). */
+    w.hooks = NULL;
+    char *normal_result = agent_execute_tool_call(&w, &call);
+    AGENT_TEST_ASSERT(normal_result != NULL);
+    if (normal_result) AGENT_TEST_ASSERT(strstr(normal_result, "Do the thing.") != NULL);
+    free(normal_result);
+
+    agent_tool_call_free(&call);
+    ds4_hooks_free(hooks);
+    ds4_config_free(cfg);
+    ds4_skills_list_free(&w.skills);
+    unlink(settings_path);
+    rmdir(ds4_dir);
+    unlink(md_path);
+    rmdir(fx);
+}
+
 static void ds4_agent_unit_tests_run(void) {
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
     test_agent_tool_skill_dispatch();
     test_agent_slash_command_known_file_commands();
+    test_agent_tool_hook_wrapper();
 }
 #endif
 
@@ -7368,7 +7479,10 @@ static pid_t agent_tool_pid(const agent_tool_call *call) {
 /* Execute one parsed DSML tool call and return the text that will be appended as
  * the tool-role result.  UI visualization already happened while streaming; this
  * function is only about side effects and the model-visible observation. */
-static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *call) {
+/* Every branch below (native tools, skill, MCP fallthrough, unknown-tool)
+ * lives here unchanged; agent_execute_tool_call (below) wraps this with
+ * PreToolUse/PostToolUse hooks and is what callers actually invoke. */
+static char *agent_execute_tool_call_inner(agent_worker *w, const agent_tool_call *call) {
     agent_buf result = {0};
     if (!call->name) return xstrdup("Tool error: missing tool name\n");
 
@@ -7449,6 +7563,110 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
         agent_buf_puts(&result, "\n");
         return agent_buf_take(&result);
     }
+}
+
+/* Dispatch wrapper around agent_execute_tool_call_inner: when no hooks are
+ * configured (the overwhelmingly common case), this forwards directly with
+ * zero extra work and no observable difference -- byte-identical dispatch.
+ * When hooks are configured, it wraps the inner call with PreToolUse /
+ * PostToolUse shell hooks (see ds4_hooks.h for the schema and payload
+ * shapes). This is the function every call site actually calls; the name
+ * and signature match what used to be agent_execute_tool_call_inner's, so
+ * no caller needed to change. */
+static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *call) {
+    if (!w->hooks) return agent_execute_tool_call_inner(w, call);
+
+    const char *tool_name = call->name ? call->name : "";
+
+    /* Same parallel-arrays construction the MCP dispatch fallthrough above
+     * uses to turn call->args[] into JSON via ds4_mcp_args_to_json. */
+    int argc = call->argc;
+    const char **names = xmalloc(sizeof(char *) * (size_t)(argc > 0 ? argc : 1));
+    const char **values = xmalloc(sizeof(char *) * (size_t)(argc > 0 ? argc : 1));
+    int *is_string = xmalloc(sizeof(int) * (size_t)(argc > 0 ? argc : 1));
+    for (int i = 0; i < argc; i++) {
+        names[i] = call->args[i].name;
+        values[i] = call->args[i].value;
+        is_string[i] = call->args[i].is_string;
+    }
+    char *tool_input_json = ds4_mcp_args_to_json(names, values, is_string, argc);
+    free(names);
+    free(values);
+    free(is_string);
+
+    ds4_json_writer pre_w = {0};
+    ds4_json_w_raw(&pre_w, "{\"event\":\"PreToolUse\",\"tool_name\":");
+    ds4_json_w_string(&pre_w, tool_name);
+    ds4_json_w_raw(&pre_w, ",\"tool_input\":");
+    ds4_json_w_raw(&pre_w, tool_input_json);
+    ds4_json_w_raw(&pre_w, "}");
+    char *pre_payload = ds4_json_w_take(&pre_w);
+
+    ds4_hook_result pre = ds4_hooks_run(w->hooks, DS4_HOOK_PRE_TOOL, tool_name, pre_payload);
+    free(pre_payload);
+
+    if (pre.warnings) agent_publishf_system_status(w, "%s", pre.warnings);
+
+    if (pre.blocked) {
+        const char *reason = pre.block_reason ? pre.block_reason : "";
+        agent_publishf_system_status(w, "Tool blocked by PreToolUse hook: %s", reason);
+        agent_buf out = {0};
+        agent_buf_puts(&out, "Tool blocked by PreToolUse hook: ");
+        agent_buf_puts(&out, reason);
+        agent_buf_puts(&out, "\n");
+        free(tool_input_json);
+        ds4_hook_result_free(&pre);
+        return agent_buf_take(&out);
+    }
+    ds4_hook_result_free(&pre);
+
+    char *result = agent_execute_tool_call_inner(w, call);
+
+    /* tool_output is the first 8 KiB of the result, never splitting a UTF-8
+     * sequence -- mirrors ds4_mcp's mcp_sanitize_desc truncation. */
+    size_t out_len = strlen(result);
+    size_t cap = 8 * 1024;
+    if (out_len > cap) {
+        while (cap > 0 && ((unsigned char)result[cap] & 0xC0) == 0x80) cap--;
+    } else {
+        cap = out_len;
+    }
+    char *tool_output = xmalloc(cap + 1);
+    memcpy(tool_output, result, cap);
+    tool_output[cap] = '\0';
+
+    ds4_json_writer post_w = {0};
+    ds4_json_w_raw(&post_w, "{\"event\":\"PostToolUse\",\"tool_name\":");
+    ds4_json_w_string(&post_w, tool_name);
+    ds4_json_w_raw(&post_w, ",\"tool_input\":");
+    ds4_json_w_raw(&post_w, tool_input_json);
+    ds4_json_w_raw(&post_w, ",\"tool_output\":");
+    ds4_json_w_string(&post_w, tool_output);
+    ds4_json_w_raw(&post_w, "}");
+    char *post_payload = ds4_json_w_take(&post_w);
+    free(tool_output);
+    free(tool_input_json);
+
+    ds4_hook_result post = ds4_hooks_run(w->hooks, DS4_HOOK_POST_TOOL, tool_name, post_payload);
+    free(post_payload);
+
+    if (post.warnings) agent_publishf_system_status(w, "%s", post.warnings);
+
+    if (post.blocked) {
+        /* A PostToolUse block does NOT undo the tool call -- it already
+         * happened -- it just annotates the result the model sees. */
+        const char *reason = post.block_reason ? post.block_reason : "";
+        agent_buf combined = {0};
+        agent_buf_puts(&combined, result);
+        agent_buf_puts(&combined, "\n[PostToolUse hook: ");
+        agent_buf_puts(&combined, reason);
+        agent_buf_puts(&combined, "]");
+        free(result);
+        result = agent_buf_take(&combined);
+    }
+    ds4_hook_result_free(&post);
+
+    return result;
 }
 
 /* Execute all tool calls from one DSML block, preserving per-call labels in the
@@ -9708,17 +9926,21 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
     ds4_skills_scan(w->config, &w->skills, skills_warn, sizeof(skills_warn));
     char mcp_warn[512] = {0};
     w->mcp = ds4_mcp_registry_create(w->config, NULL, mcp_warn, sizeof(mcp_warn));
-    if (cfg_warn[0] || commands_warn[0] || skills_warn[0] || mcp_warn[0]) {
+    char hooks_warn[512] = {0};
+    w->hooks = ds4_hooks_load(w->config, hooks_warn, sizeof(hooks_warn));
+    if (cfg_warn[0] || commands_warn[0] || skills_warn[0] || mcp_warn[0] || hooks_warn[0]) {
         if (cfg->non_interactive) {
             if (cfg_warn[0]) fputs(cfg_warn, stderr);
             if (commands_warn[0]) fputs(commands_warn, stderr);
             if (skills_warn[0]) fputs(skills_warn, stderr);
             if (mcp_warn[0]) fputs(mcp_warn, stderr);
+            if (hooks_warn[0]) fputs(hooks_warn, stderr);
         } else {
             if (cfg_warn[0]) agent_publishf_system_status(w, "%s", cfg_warn);
             if (commands_warn[0]) agent_publishf_system_status(w, "%s", commands_warn);
             if (skills_warn[0]) agent_publishf_system_status(w, "%s", skills_warn);
             if (mcp_warn[0]) agent_publishf_system_status(w, "%s", mcp_warn);
+            if (hooks_warn[0]) agent_publishf_system_status(w, "%s", hooks_warn);
         }
     }
     ds4_web_config web_cfg = {
@@ -9757,6 +9979,7 @@ static void agent_worker_free(agent_worker *w) {
     ds4_skills_list_free(&w->skills);
     ds4_commands_list_free(&g_agent_commands);
     ds4_mcp_registry_free(w->mcp);
+    ds4_hooks_free(w->hooks);
     ds4_config_free(w->config);
     free(w->cache_dir);
     free(w->sysprompt_path);
