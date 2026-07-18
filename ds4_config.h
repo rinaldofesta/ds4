@@ -16,6 +16,25 @@ const char *ds4_config_project_root(const ds4_config *c); /* NULL if none */
 const char *ds4_config_project_ds4_dir(const ds4_config *c); /* "<root>/.ds4" or NULL (returned even if the dir doesn't exist yet -- callers stat it) */
 const char *ds4_config_user_ds4_dir(const ds4_config *c);    /* "~/.ds4" expanded, NULL if no HOME */
 
+/* Absolute path of the discovered project memory file (AGENTS.md preferred,
+ * DS4.md otherwise), or NULL if neither was found. Discovery walks upward
+ * from the same start_dir as project-root discovery but is INDEPENDENT of
+ * any .ds4 dir or .git entry -- a memory file works even with neither
+ * present. At each level, AGENTS.md wins over DS4.md; across levels, the
+ * nearest level containing either file wins (so a nearer DS4.md beats a
+ * farther AGENTS.md). Same 64-level walk guard as project-root discovery.
+ * Reading the file's content is the caller's job -- see
+ * ds4_config_read_capped_file. */
+const char *ds4_config_memory_path(const ds4_config *c);
+
+/* Reads <path> as a capped (1 MiB) text blob: malloc'd, NUL-terminated,
+ * owned by the caller. A missing file returns NULL silently (not an error,
+ * warn untouched); anything else wrong (not a regular file, oversized,
+ * unreadable, OOM) is fail-open -- NULL plus a one-line warning appended to
+ * warn, the same contract cfg_load_settings uses for settings.json. Generic
+ * (no JSON parsing); used today to load the project memory file. */
+char *ds4_config_read_capped_file(const char *path, char *warn, size_t warn_len);
+
 /* Merged settings lookup: project settings.json first, then user. NULL if the
  * key is absent from both. Returned pointer is owned by the config object. */
 const ds4_json_value *ds4_config_get(const ds4_config *c, const char *key);

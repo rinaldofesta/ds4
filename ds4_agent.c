@@ -114,6 +114,7 @@ typedef struct {
     ds4_mcp_registry *mcp;
     ds4_hooks *hooks;
     ds4_permissions *perms;
+    char *project_memory_text; /* loaded AGENTS.md/DS4.md content, NULL if none/blank */
     char *sysprompt_path;
     char session_sha[41];
     char *session_title;
@@ -4088,11 +4089,42 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
     return ok;
 }
 
+/* Reads the project's memory file if ds4_config discovered one (AGENTS.md
+ * preferred, else DS4.md). An unreadable file (not a regular file, over the
+ * 1 MiB cap, unopenable, OOM) is fail-open: NULL is returned and a warning
+ * appended, same contract as ds4_config_read_capped_file/settings.json.
+ * Whitespace-only content is treated as absent (NULL, no warning) since it
+ * would add zero meaningful tokens to the prompt anyway. Caller frees the
+ * returned buffer. Pure function of cfg -- no engine, no other worker state
+ * -- so it is testable without a loaded model. */
+static char *agent_load_project_memory_text(const ds4_config *cfg, char *warn, size_t warn_len) {
+    const char *path = ds4_config_memory_path(cfg);
+    if (!path) return NULL;
+
+    char *text = ds4_config_read_capped_file(path, warn, warn_len);
+    if (!text) return NULL;
+
+    bool blank = true;
+    for (const char *p = text; *p; p++) {
+        if (!isspace((unsigned char)*p)) { blank = false; break; }
+    }
+    if (blank) {
+        free(text);
+        return NULL;
+    }
+    return text;
+}
+
 /* Appended after the fixed system prompt: dynamic, worker-specific context
- * that varies with what was discovered at startup (skills today; MCP tool
- * schemas and project memory in later tasks). Single-purpose for now: with
- * no skills discovered, ds4_skills_catalog_prompt_text returns NULL and this
- * appends zero tokens, so the rendered prompt is unchanged. */
+ * that varies with what was discovered at startup -- skills, MCP tool
+ * schemas, and (this task) project memory. With nothing discovered in any of
+ * the three, this appends zero tokens, so the rendered prompt is unchanged.
+ * The skills/MCP blocks are trusted DS4-authored catalog text, tokenized as
+ * rendered chat; project memory is repo-authored and UNTRUSTED, so unlike
+ * those it goes through ds4_chat_append_message as plain "system" text --
+ * never ds4_tokenize_rendered_chat -- so it can never smuggle in a literal
+ * DSML/<think>/<｜User｜> control token. This mirrors exactly how the -sys
+ * user system text is appended in agent_append_system_prompt. */
 static void agent_append_dynamic_context(agent_worker *w, ds4_tokens *out) {
     char *skills_prompt = ds4_skills_catalog_prompt_text(&w->skills);
     if (skills_prompt) {
@@ -4103,6 +4135,20 @@ static void agent_append_dynamic_context(agent_worker *w, ds4_tokens *out) {
     if (m) {
         ds4_tokenize_rendered_chat(w->engine, m, out);
         free(m);
+    }
+    if (w->project_memory_text && w->project_memory_text[0]) {
+        const char *path = ds4_config_memory_path(w->config);
+        const char *base = path ? strrchr(path, '/') : NULL;
+        base = base ? base + 1 : (path ? path : "project memory");
+        char header[300];
+        snprintf(header, sizeof(header), "Project memory (%s):\n\n", base);
+        size_t hlen = strlen(header);
+        size_t tlen = strlen(w->project_memory_text);
+        char *msg = xmalloc(hlen + tlen + 1);
+        memcpy(msg, header, hlen);
+        memcpy(msg + hlen, w->project_memory_text, tlen + 1);
+        ds4_chat_append_message(w->engine, out, "system", msg);
+        free(msg);
     }
 }
 
@@ -6697,6 +6743,88 @@ static void test_agent_permission_gate(void) {
     rmdir(fx);
 }
 
+/* agent_load_project_memory_text is a pure function of (ds4_config *, warn
+ * buffer) -- no engine, no worker state -- so its discovery+read+blank
+ * handling is testable directly. The other half of this task,
+ * agent_append_dynamic_context's memory branch, calls ds4_chat_append_message
+ * which tokenizes through a real ds4_vocab; that requires an actual loaded
+ * model and is NOT exercised by this zero-model test binary, so it is
+ * deliberately left untested here. */
+static void test_agent_project_memory_load(void) {
+    char tmpl[] = "/tmp/ds4_agent_project_memory_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    AGENT_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    char agents_path[PATH_MAX];
+    snprintf(agents_path, sizeof(agents_path), "%s/AGENTS.md", fx);
+
+    /* No memory file discovered at all: NULL, no warning. */
+    {
+        ds4_config *cfg = ds4_config_load(fx, NULL, 0);
+        AGENT_TEST_ASSERT(cfg != NULL);
+        char warn[256] = {0};
+        char *text = agent_load_project_memory_text(cfg, warn, sizeof(warn));
+        AGENT_TEST_ASSERT(text == NULL);
+        AGENT_TEST_ASSERT(warn[0] == '\0');
+        free(text);
+        ds4_config_free(cfg);
+    }
+
+    /* Empty file (0 bytes): discovered, but absent per the empty/blank rule. */
+    {
+        FILE *fp = fopen(agents_path, "wb");
+        AGENT_TEST_ASSERT(fp != NULL);
+        if (fp) fclose(fp);
+
+        ds4_config *cfg = ds4_config_load(fx, NULL, 0);
+        AGENT_TEST_ASSERT(cfg != NULL);
+        AGENT_TEST_ASSERT(ds4_config_memory_path(cfg) != NULL);
+        char warn[256] = {0};
+        char *text = agent_load_project_memory_text(cfg, warn, sizeof(warn));
+        AGENT_TEST_ASSERT(text == NULL);
+        AGENT_TEST_ASSERT(warn[0] == '\0');
+        free(text);
+        ds4_config_free(cfg);
+    }
+
+    /* Whitespace-only file: also treated as absent. */
+    {
+        FILE *fp = fopen(agents_path, "wb");
+        AGENT_TEST_ASSERT(fp != NULL);
+        if (fp) { fputs("   \n\t\n  ", fp); fclose(fp); }
+
+        ds4_config *cfg = ds4_config_load(fx, NULL, 0);
+        AGENT_TEST_ASSERT(cfg != NULL);
+        char warn[256] = {0};
+        char *text = agent_load_project_memory_text(cfg, warn, sizeof(warn));
+        AGENT_TEST_ASSERT(text == NULL);
+        AGENT_TEST_ASSERT(warn[0] == '\0');
+        free(text);
+        ds4_config_free(cfg);
+    }
+
+    /* Real content: loaded verbatim. */
+    {
+        FILE *fp = fopen(agents_path, "wb");
+        AGENT_TEST_ASSERT(fp != NULL);
+        if (fp) { fputs("Use tabs, not spaces.\n", fp); fclose(fp); }
+
+        ds4_config *cfg = ds4_config_load(fx, NULL, 0);
+        AGENT_TEST_ASSERT(cfg != NULL);
+        char warn[256] = {0};
+        char *text = agent_load_project_memory_text(cfg, warn, sizeof(warn));
+        AGENT_TEST_ASSERT(text != NULL);
+        if (text) AGENT_TEST_ASSERT(strcmp(text, "Use tabs, not spaces.\n") == 0);
+        AGENT_TEST_ASSERT(warn[0] == '\0');
+        free(text);
+        ds4_config_free(cfg);
+    }
+
+    unlink(agents_path);
+    rmdir(fx);
+}
+
 static void ds4_agent_unit_tests_run(void) {
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
@@ -6705,6 +6833,7 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_tool_hook_wrapper();
     test_agent_tool_call_subject_extraction();
     test_agent_permission_gate();
+    test_agent_project_memory_load();
 }
 #endif
 
@@ -10189,7 +10318,9 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
     w->hooks = ds4_hooks_load(w->config, hooks_warn, sizeof(hooks_warn));
     char perms_warn[512] = {0};
     w->perms = ds4_permissions_load(w->config, perms_warn, sizeof(perms_warn));
-    if (cfg_warn[0] || commands_warn[0] || skills_warn[0] || mcp_warn[0] || hooks_warn[0] || perms_warn[0]) {
+    char mem_warn[512] = {0};
+    w->project_memory_text = agent_load_project_memory_text(w->config, mem_warn, sizeof(mem_warn));
+    if (cfg_warn[0] || commands_warn[0] || skills_warn[0] || mcp_warn[0] || hooks_warn[0] || perms_warn[0] || mem_warn[0]) {
         if (cfg->non_interactive) {
             if (cfg_warn[0]) fputs(cfg_warn, stderr);
             if (commands_warn[0]) fputs(commands_warn, stderr);
@@ -10197,6 +10328,7 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
             if (mcp_warn[0]) fputs(mcp_warn, stderr);
             if (hooks_warn[0]) fputs(hooks_warn, stderr);
             if (perms_warn[0]) fputs(perms_warn, stderr);
+            if (mem_warn[0]) fputs(mem_warn, stderr);
         } else {
             if (cfg_warn[0]) agent_publishf_system_status(w, "%s", cfg_warn);
             if (commands_warn[0]) agent_publishf_system_status(w, "%s", commands_warn);
@@ -10204,6 +10336,18 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
             if (mcp_warn[0]) agent_publishf_system_status(w, "%s", mcp_warn);
             if (hooks_warn[0]) agent_publishf_system_status(w, "%s", hooks_warn);
             if (perms_warn[0]) agent_publishf_system_status(w, "%s", perms_warn);
+            if (mem_warn[0]) agent_publishf_system_status(w, "%s", mem_warn);
+        }
+    }
+    if (w->project_memory_text) {
+        const char *mem_path = ds4_config_memory_path(w->config);
+        size_t mem_bytes = strlen(w->project_memory_text);
+        if (cfg->non_interactive) {
+            fprintf(stderr, "ds4-agent: project memory: %s (%zu bytes)\n",
+                    mem_path, mem_bytes);
+        } else {
+            agent_publishf_system_status(w, "Project memory: %s (%zu bytes)",
+                                          mem_path, mem_bytes);
         }
     }
     ds4_web_config web_cfg = {
@@ -10244,6 +10388,7 @@ static void agent_worker_free(agent_worker *w) {
     ds4_mcp_registry_free(w->mcp);
     ds4_hooks_free(w->hooks);
     ds4_permissions_free(w->perms);
+    free(w->project_memory_text);
     ds4_config_free(w->config);
     free(w->cache_dir);
     free(w->sysprompt_path);

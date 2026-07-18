@@ -39,6 +39,7 @@ struct ds4_config {
     char *project_root;    /* NULL if none */
     char *project_ds4_dir; /* "<root>/.ds4", NULL if no root */
     char *user_ds4_dir;    /* "<home>/.ds4", NULL if no HOME */
+    char *memory_path;     /* discovered AGENTS.md/DS4.md, NULL if neither */
     ds4_json_value *project_settings; /* NULL if absent/malformed/no root */
     ds4_json_value *user_settings;    /* NULL if absent/malformed/no HOME */
     ds4_config_root_entry *roots;
@@ -135,10 +136,52 @@ static char *cfg_find_project_root(const char *start_dir) {
     return NULL;
 }
 
-/* Reads and parses <path> as a settings.json object. Missing file is not an
- * error (returns NULL silently). Anything else wrong (too big, unreadable,
- * malformed, non-object root) is fail-open: skip and append a warning. */
-static ds4_json_value *cfg_load_settings(const char *path, char *warn, size_t warn_len) {
+/* Walks from start_dir upward exactly like cfg_find_project_root, but looks
+ * for a project memory file instead of a .ds4/.git marker, and is otherwise
+ * unrelated to it -- a memory file is discovered whether or not a project
+ * root exists. At each level, AGENTS.md is checked first, then DS4.md; the
+ * first hit (at the nearest level) wins, so a nearer DS4.md beats a farther
+ * AGENTS.md, but AGENTS.md beats DS4.md within the same level. Same 64-level
+ * guard. Returns a malloc'd absolute path, or NULL if neither name was found
+ * within the walk guard. */
+static char *cfg_find_memory_path(const char *start_dir) {
+    char *cur = cfg_realpath_or_copy(start_dir);
+    if (!cur) return NULL;
+
+    for (int level = 0; level < DS4_CONFIG_MAX_WALK_LEVELS; level++) {
+        char *agents_path = cfg_join(cur, "AGENTS.md");
+        if (agents_path && cfg_exists(agents_path)) {
+            free(cur);
+            return agents_path;
+        }
+        free(agents_path);
+
+        char *ds4_md_path = cfg_join(cur, "DS4.md");
+        if (ds4_md_path && cfg_exists(ds4_md_path)) {
+            free(cur);
+            return ds4_md_path;
+        }
+        free(ds4_md_path);
+
+        char *parent = cfg_parent(cur);
+        if (!parent || strcmp(parent, cur) == 0) {
+            free(parent);
+            break;
+        }
+        free(cur);
+        cur = parent;
+    }
+    free(cur);
+    return NULL;
+}
+
+/* Reads <path> as a capped (1 MiB) blob: malloc'd, NUL-terminated. Missing
+ * file is not an error (returns NULL silently). Anything else wrong (not a
+ * regular file, too big, unreadable, OOM) is fail-open: skip and append a
+ * warning. No parsing -- generic byte read shared by cfg_load_settings
+ * (which parses the result as JSON) and, via ds4_config_read_capped_file,
+ * by callers outside this module (today: the agent's project memory load). */
+static char *cfg_read_capped_file(const char *path, char *warn, size_t warn_len) {
     struct stat st;
     if (stat(path, &st) != 0) return NULL; /* missing is not an error */
 
@@ -167,6 +210,15 @@ static ds4_json_value *cfg_load_settings(const char *path, char *warn, size_t wa
     size_t n = fread(buf, 1, (size_t)st.st_size, fp);
     fclose(fp);
     buf[n] = '\0';
+    return buf;
+}
+
+/* Reads and parses <path> as a settings.json object. Missing file is not an
+ * error (returns NULL silently). Anything else wrong (too big, unreadable,
+ * malformed, non-object root) is fail-open: skip and append a warning. */
+static ds4_json_value *cfg_load_settings(const char *path, char *warn, size_t warn_len) {
+    char *buf = cfg_read_capped_file(path, warn, warn_len);
+    if (!buf) return NULL;
 
     char err[128];
     ds4_json_value *v = ds4_json_parse(buf, err, sizeof(err));
@@ -311,6 +363,10 @@ ds4_config *ds4_config_load(const char *start_dir, char *warn, size_t warn_len) 
     const char *effective_start = start_dir;
     if (!effective_start) effective_start = getcwd(cwd_buf, sizeof(cwd_buf)) ? cwd_buf : ".";
 
+    /* Independent of project-root discovery: a memory file is found whether
+     * or not a .ds4 dir or .git entry exists anywhere in the walk. */
+    c->memory_path = cfg_find_memory_path(effective_start);
+
     c->project_root = cfg_find_project_root(effective_start);
     if (c->project_root) {
         c->project_ds4_dir = cfg_join(c->project_root, ".ds4");
@@ -364,6 +420,7 @@ void ds4_config_free(ds4_config *c) {
     free(c->project_root);
     free(c->project_ds4_dir);
     free(c->user_ds4_dir);
+    free(c->memory_path);
     ds4_json_free(c->project_settings);
     ds4_json_free(c->user_settings);
     for (int i = 0; i < c->root_count; i++) {
@@ -384,6 +441,15 @@ const char *ds4_config_project_ds4_dir(const ds4_config *c) {
 
 const char *ds4_config_user_ds4_dir(const ds4_config *c) {
     return c ? c->user_ds4_dir : NULL;
+}
+
+const char *ds4_config_memory_path(const ds4_config *c) {
+    return c ? c->memory_path : NULL;
+}
+
+char *ds4_config_read_capped_file(const char *path, char *warn, size_t warn_len) {
+    if (!path) return NULL;
+    return cfg_read_capped_file(path, warn, warn_len);
 }
 
 const ds4_json_value *ds4_config_get(const ds4_config *c, const char *key) {
@@ -924,6 +990,180 @@ static void test_neither_root_accessors(void) {
     cfg_test_rmtree(fx);
 }
 
+/* ---- project memory discovery (AGENTS.md/DS4.md) ---- */
+
+/* Both files present at the same level: AGENTS.md wins. */
+static void test_memory_agents_beats_ds4_same_level(void) {
+    char tmpl[] = "/tmp/ds4_cfg_mem_same_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    CFG_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    char *proj = cfg_test_join(fx, "proj");
+    char *agents = cfg_test_join(proj, "AGENTS.md");
+    char *ds4md = cfg_test_join(proj, "DS4.md");
+    cfg_test_mkdir_p(proj);
+    cfg_test_write_file(agents, "agents content\n");
+    cfg_test_write_file(ds4md, "ds4 content\n");
+
+    char resolved[PATH_MAX];
+    CFG_TEST_ASSERT(realpath(proj, resolved) != NULL);
+    char expected[PATH_MAX + 16];
+    snprintf(expected, sizeof(expected), "%s/AGENTS.md", resolved);
+
+    ds4_config *c = ds4_config_load(proj, NULL, 0);
+    CFG_TEST_ASSERT(c != NULL);
+    if (c) {
+        const char *mem = ds4_config_memory_path(c);
+        CFG_TEST_ASSERT(mem != NULL);
+        if (mem) CFG_TEST_ASSERT(strcmp(mem, expected) == 0);
+    }
+    ds4_config_free(c);
+
+    free(proj); free(agents); free(ds4md);
+    cfg_test_rmtree(fx);
+}
+
+/* DS4.md at the start level, AGENTS.md two levels up: the nearer DS4.md
+ * wins even though AGENTS.md would otherwise take precedence at its own
+ * level -- level precedence (nearest wins) outranks the AGENTS.md-over-DS4.md
+ * tie-break, which only applies within a single level. */
+static void test_memory_nearer_ds4_beats_farther_agents(void) {
+    char tmpl[] = "/tmp/ds4_cfg_mem_nearer_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    CFG_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    char *outer = cfg_test_join(fx, "outer");
+    char *outer_agents = cfg_test_join(outer, "AGENTS.md");
+    char *inner = cfg_test_join(outer, "inner");
+    char *inner_ds4md = cfg_test_join(inner, "DS4.md");
+    char *start = cfg_test_join(inner, "x/y");
+    cfg_test_mkdir_p(inner);
+    cfg_test_write_file(outer_agents, "outer agents\n");
+    cfg_test_write_file(inner_ds4md, "inner ds4\n");
+    cfg_test_mkdir_p(start);
+
+    char resolved_inner[PATH_MAX];
+    CFG_TEST_ASSERT(realpath(inner, resolved_inner) != NULL);
+    char expected[PATH_MAX + 16];
+    snprintf(expected, sizeof(expected), "%s/DS4.md", resolved_inner);
+
+    ds4_config *c = ds4_config_load(start, NULL, 0);
+    CFG_TEST_ASSERT(c != NULL);
+    if (c) {
+        const char *mem = ds4_config_memory_path(c);
+        CFG_TEST_ASSERT(mem != NULL);
+        if (mem) CFG_TEST_ASSERT(strcmp(mem, expected) == 0);
+    }
+    ds4_config_free(c);
+
+    free(outer); free(outer_agents); free(inner); free(inner_ds4md); free(start);
+    cfg_test_rmtree(fx);
+}
+
+/* Memory discovery is independent of project-root discovery: a fixture with
+ * no .ds4 dir and no .git entry anywhere still yields a memory_path, while
+ * project_root/project_ds4_dir stay NULL (soft invariant on that pair --
+ * same caution as test_no_marker_project_root, since that half of the walk
+ * could in principle escape into the real filesystem above the fixture; the
+ * memory_path assertion itself is hard since AGENTS.md is placed inside the
+ * fixture and is found before the walk ever needs to escape it). */
+static void test_memory_independent_of_project_markers(void) {
+    char tmpl[] = "/tmp/ds4_cfg_mem_indep_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    CFG_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    char *proj = cfg_test_join(fx, "proj");
+    char *agents = cfg_test_join(proj, "AGENTS.md");
+    char *start = cfg_test_join(proj, "a/b");
+    cfg_test_mkdir_p(start);
+    cfg_test_write_file(agents, "memory without a project root\n");
+
+    char resolved[PATH_MAX];
+    CFG_TEST_ASSERT(realpath(proj, resolved) != NULL);
+    char expected[PATH_MAX + 16];
+    snprintf(expected, sizeof(expected), "%s/AGENTS.md", resolved);
+
+    ds4_config *c = ds4_config_load(start, NULL, 0);
+    CFG_TEST_ASSERT(c != NULL);
+    if (c) {
+        const char *root = ds4_config_project_root(c);
+        const char *pdir = ds4_config_project_ds4_dir(c);
+        CFG_TEST_ASSERT((root == NULL) == (pdir == NULL));
+
+        const char *mem = ds4_config_memory_path(c);
+        CFG_TEST_ASSERT(mem != NULL);
+        if (mem) CFG_TEST_ASSERT(strcmp(mem, expected) == 0);
+    }
+    ds4_config_free(c);
+
+    free(proj); free(agents); free(start);
+    cfg_test_rmtree(fx);
+}
+
+/* Neither AGENTS.md nor DS4.md exists anywhere inside the fixture. In
+ * principle the walk could escape above the fixture into the real
+ * filesystem and find either name there (same caution as
+ * test_no_marker_project_root); in practice a tmp dir's ancestors up to "/"
+ * carry neither, so this locks the common-case guarantee that matters for
+ * this task: no memory file anywhere -> memory_path NULL -> the agent's
+ * dynamic-context/system-status paths add zero bytes. */
+static void test_memory_absent_when_neither_present(void) {
+    char tmpl[] = "/tmp/ds4_cfg_mem_absent_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    CFG_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    char *start = cfg_test_join(fx, "proj/a/b");
+    cfg_test_mkdir_p(start);
+
+    ds4_config *c = ds4_config_load(start, NULL, 0);
+    CFG_TEST_ASSERT(c != NULL);
+    if (c) CFG_TEST_ASSERT(ds4_config_memory_path(c) == NULL);
+    ds4_config_free(c);
+
+    free(start);
+    cfg_test_rmtree(fx);
+}
+
+/* Fixture-boundary caution (Task 2 style): the only marker anywhere in this
+ * fixture sits at its top level (proj/DS4.md, with no AGENTS.md competing
+ * anywhere), and the start dir is several levels below it. The walk must
+ * still find it without ever needing to look outside the fixture, so this
+ * assertion carries no escape risk regardless of what the real filesystem
+ * above the fixture happens to contain. */
+static void test_memory_walk_multiple_levels_bounded_by_fixture(void) {
+    char tmpl[] = "/tmp/ds4_cfg_mem_bounded_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    CFG_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    char *proj = cfg_test_join(fx, "proj");
+    char *proj_ds4md = cfg_test_join(proj, "DS4.md");
+    char *start = cfg_test_join(proj, "w/x/y/z");
+    cfg_test_mkdir_p(start);
+    cfg_test_write_file(proj_ds4md, "bounded fixture memory\n");
+
+    char resolved[PATH_MAX];
+    CFG_TEST_ASSERT(realpath(proj, resolved) != NULL);
+    char expected[PATH_MAX + 16];
+    snprintf(expected, sizeof(expected), "%s/DS4.md", resolved);
+
+    ds4_config *c = ds4_config_load(start, NULL, 0);
+    CFG_TEST_ASSERT(c != NULL);
+    if (c) {
+        const char *mem = ds4_config_memory_path(c);
+        CFG_TEST_ASSERT(mem != NULL);
+        if (mem) CFG_TEST_ASSERT(strcmp(mem, expected) == 0);
+    }
+    ds4_config_free(c);
+
+    free(proj); free(proj_ds4md); free(start);
+    cfg_test_rmtree(fx);
+}
+
 int ds4_config_unit_tests_run(void) {
     test_root_discovery();
     test_no_marker_project_root();
@@ -932,6 +1172,11 @@ int ds4_config_unit_tests_run(void) {
     test_roots_listing();
     test_neither_root_accessors();
     test_plugin_root_ordering();
+    test_memory_agents_beats_ds4_same_level();
+    test_memory_nearer_ds4_beats_farther_agents();
+    test_memory_independent_of_project_markers();
+    test_memory_absent_when_neither_present();
+    test_memory_walk_multiple_levels_bounded_by_fixture();
     return cfg_test_failures;
 }
 #endif
