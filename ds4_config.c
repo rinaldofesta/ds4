@@ -1,0 +1,680 @@
+#include "ds4_config.h"
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+/* .ds4 discovery + settings load/merge. No dependencies beyond libc and
+ * ds4_json. See ds4_config.h for the contract.
+ *
+ * Directory conventions:
+ *  - project root: nearest ancestor of the start dir containing a .ds4
+ *    directory or a .git entry (directory or file -- worktrees use a .git
+ *    file). Search walks up to the filesystem root; first hit wins.
+ *  - user dir: ~/.ds4 via $HOME; NULL if HOME is unset/empty.
+ *  - settings: <project-root>/.ds4/settings.json and ~/.ds4/settings.json,
+ *    both optional. Merged view: project wins per top-level key (no deep
+ *    merge in V1). */
+
+#define DS4_CONFIG_MAX_SETTINGS_SIZE (1u << 20) /* 1 MiB */
+#define DS4_CONFIG_MAX_WALK_LEVELS 64
+
+struct ds4_config {
+    char *project_root;    /* NULL if none */
+    char *project_ds4_dir; /* "<root>/.ds4", NULL if no root */
+    char *user_ds4_dir;    /* "<home>/.ds4", NULL if no HOME */
+    ds4_json_value *project_settings; /* NULL if absent/malformed/no root */
+    ds4_json_value *user_settings;    /* NULL if absent/malformed/no HOME */
+};
+
+static char *cfg_strdup(const char *s) {
+    size_t n = strlen(s);
+    char *p = malloc(n + 1);
+    if (p) memcpy(p, s, n + 1);
+    return p;
+}
+
+/* Simple static join, deliberately not depending on ds4_kvstore_path_join so
+ * this module stays standalone-compilable for its test binary. */
+static char *cfg_join(const char *dir, const char *name) {
+    size_t dlen = strlen(dir);
+    int need_slash = dlen > 0 && dir[dlen - 1] != '/';
+    size_t nlen = strlen(name);
+    char *out = malloc(dlen + (need_slash ? 1 : 0) + nlen + 1);
+    if (!out) return NULL;
+    memcpy(out, dir, dlen);
+    size_t pos = dlen;
+    if (need_slash) out[pos++] = '/';
+    memcpy(out + pos, name, nlen);
+    pos += nlen;
+    out[pos] = '\0';
+    return out;
+}
+
+static void cfg_warn_append(char *warn, size_t warn_len, const char *path, const char *problem) {
+    if (!warn || warn_len == 0) return;
+    size_t cur = strlen(warn);
+    if (cur + 1 >= warn_len) return; /* no room left */
+    snprintf(warn + cur, warn_len - cur, "config: %s: %s\n", path, problem);
+}
+
+static int cfg_is_dir(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static int cfg_exists(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+/* Resolves symlinks (e.g. /tmp -> /private/tmp on macOS, or a symlinked
+ * worktree) once up front so the subsequent walk is plain string surgery. */
+static char *cfg_realpath_or_copy(const char *path) {
+    char buf[PATH_MAX];
+    if (realpath(path, buf)) return cfg_strdup(buf);
+    return cfg_strdup(path);
+}
+
+/* path is an absolute, realpath-normalized dir with no trailing slash
+ * (except "/" itself). Returns the parent, or NULL once at "/". */
+static char *cfg_parent(const char *path) {
+    if (strcmp(path, "/") == 0) return NULL;
+    const char *slash = strrchr(path, '/');
+    if (!slash) return NULL;
+    size_t len = (slash == path) ? 1 : (size_t)(slash - path);
+    char *out = malloc(len + 1);
+    if (!out) return NULL;
+    memcpy(out, path, len);
+    out[len] = '\0';
+    return out;
+}
+
+/* Walks from start_dir upward; first directory containing a .ds4 dir or a
+ * .git entry (dir or file) wins. Returns a malloc'd absolute path, or NULL
+ * if no marker was found within the walk guard. */
+static char *cfg_find_project_root(const char *start_dir) {
+    char *cur = cfg_realpath_or_copy(start_dir);
+    if (!cur) return NULL;
+
+    for (int level = 0; level < DS4_CONFIG_MAX_WALK_LEVELS; level++) {
+        char *ds4_dir = cfg_join(cur, ".ds4");
+        char *git_entry = cfg_join(cur, ".git");
+        int hit = (ds4_dir && cfg_is_dir(ds4_dir)) || (git_entry && cfg_exists(git_entry));
+        free(ds4_dir);
+        free(git_entry);
+        if (hit) return cur;
+
+        char *parent = cfg_parent(cur);
+        if (!parent || strcmp(parent, cur) == 0) {
+            free(parent);
+            break;
+        }
+        free(cur);
+        cur = parent;
+    }
+    free(cur);
+    return NULL;
+}
+
+/* Reads and parses <path> as a settings.json object. Missing file is not an
+ * error (returns NULL silently). Anything else wrong (too big, unreadable,
+ * malformed, non-object root) is fail-open: skip and append a warning. */
+static ds4_json_value *cfg_load_settings(const char *path, char *warn, size_t warn_len) {
+    struct stat st;
+    if (stat(path, &st) != 0) return NULL; /* missing is not an error */
+
+    if (!S_ISREG(st.st_mode)) {
+        cfg_warn_append(warn, warn_len, path, "not a regular file, skipped");
+        return NULL;
+    }
+    if (st.st_size < 0 || (size_t)st.st_size > DS4_CONFIG_MAX_SETTINGS_SIZE) {
+        cfg_warn_append(warn, warn_len, path, "exceeds 1 MiB, skipped");
+        return NULL;
+    }
+
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        cfg_warn_append(warn, warn_len, path, "could not open, skipped");
+        return NULL;
+    }
+
+    size_t cap = (size_t)st.st_size + 1;
+    char *buf = malloc(cap);
+    if (!buf) {
+        fclose(fp);
+        cfg_warn_append(warn, warn_len, path, "out of memory, skipped");
+        return NULL;
+    }
+    size_t n = fread(buf, 1, (size_t)st.st_size, fp);
+    fclose(fp);
+    buf[n] = '\0';
+
+    char err[128];
+    ds4_json_value *v = ds4_json_parse(buf, err, sizeof(err));
+    free(buf);
+
+    if (!v) {
+        cfg_warn_append(warn, warn_len, path, err[0] ? err : "malformed JSON, skipped");
+        return NULL;
+    }
+    if (ds4_json_type_of(v) != DS4_JSON_OBJ) {
+        cfg_warn_append(warn, warn_len, path, "root is not an object, skipped");
+        ds4_json_free(v);
+        return NULL;
+    }
+    return v;
+}
+
+ds4_config *ds4_config_load(const char *start_dir, char *warn, size_t warn_len) {
+    if (warn && warn_len) warn[0] = '\0';
+
+    ds4_config *c = calloc(1, sizeof(*c));
+    if (!c) return NULL;
+
+    char cwd_buf[PATH_MAX];
+    const char *effective_start = start_dir;
+    if (!effective_start) effective_start = getcwd(cwd_buf, sizeof(cwd_buf)) ? cwd_buf : ".";
+
+    c->project_root = cfg_find_project_root(effective_start);
+    if (c->project_root) {
+        c->project_ds4_dir = cfg_join(c->project_root, ".ds4");
+        if (!c->project_ds4_dir) {
+            ds4_config_free(c);
+            return NULL;
+        }
+    }
+
+    const char *home = getenv("HOME");
+    if (home && home[0]) {
+        c->user_ds4_dir = cfg_join(home, ".ds4");
+        if (!c->user_ds4_dir) {
+            ds4_config_free(c);
+            return NULL;
+        }
+    }
+
+    if (c->project_ds4_dir) {
+        char *settings_path = cfg_join(c->project_ds4_dir, "settings.json");
+        if (!settings_path) {
+            ds4_config_free(c);
+            return NULL;
+        }
+        c->project_settings = cfg_load_settings(settings_path, warn, warn_len);
+        free(settings_path);
+    }
+    if (c->user_ds4_dir) {
+        char *settings_path = cfg_join(c->user_ds4_dir, "settings.json");
+        if (!settings_path) {
+            ds4_config_free(c);
+            return NULL;
+        }
+        c->user_settings = cfg_load_settings(settings_path, warn, warn_len);
+        free(settings_path);
+    }
+
+    return c;
+}
+
+void ds4_config_free(ds4_config *c) {
+    if (!c) return;
+    free(c->project_root);
+    free(c->project_ds4_dir);
+    free(c->user_ds4_dir);
+    ds4_json_free(c->project_settings);
+    ds4_json_free(c->user_settings);
+    free(c);
+}
+
+const char *ds4_config_project_root(const ds4_config *c) {
+    return c ? c->project_root : NULL;
+}
+
+const char *ds4_config_project_ds4_dir(const ds4_config *c) {
+    return c ? c->project_ds4_dir : NULL;
+}
+
+const char *ds4_config_user_ds4_dir(const ds4_config *c) {
+    return c ? c->user_ds4_dir : NULL;
+}
+
+const ds4_json_value *ds4_config_get(const ds4_config *c, const char *key) {
+    if (!c || !key) return NULL;
+    const ds4_json_value *v = ds4_json_obj_get(c->project_settings, key);
+    if (v) return v;
+    return ds4_json_obj_get(c->user_settings, key);
+}
+
+int ds4_config_root_count(const ds4_config *c) {
+    if (!c) return 0;
+    int n = 0;
+    if (c->project_ds4_dir) n++;
+    if (c->user_ds4_dir) n++;
+    return n;
+}
+
+const char *ds4_config_root_at(const ds4_config *c, int i) {
+    if (!c || i < 0) return NULL;
+    int idx = 0;
+    if (c->project_ds4_dir) {
+        if (idx == i) return c->project_ds4_dir;
+        idx++;
+    }
+    if (c->user_ds4_dir) {
+        if (idx == i) return c->user_ds4_dir;
+        idx++;
+    }
+    return NULL;
+}
+
+#ifdef DS4_CONFIG_TEST
+#include <dirent.h>
+
+static int cfg_test_failures;
+
+static void cfg_test_assert(int cond, const char *expr, const char *file, int line) {
+    if (cond) return;
+    fprintf(stderr, "%s:%d: assertion failed: %s\n", file, line, expr);
+    cfg_test_failures++;
+}
+#define CFG_TEST_ASSERT(expr) cfg_test_assert((expr), #expr, __FILE__, __LINE__)
+
+/* ---- self-contained fixture helpers (independent of module internals, so
+ * the test file itself never has to change between RED and GREEN) ---- */
+
+static char *cfg_test_join(const char *dir, const char *name) {
+    size_t dlen = strlen(dir);
+    int need_slash = dlen > 0 && dir[dlen - 1] != '/';
+    size_t nlen = strlen(name);
+    char *out = malloc(dlen + (need_slash ? 1 : 0) + nlen + 1);
+    if (!out) return NULL;
+    memcpy(out, dir, dlen);
+    size_t pos = dlen;
+    if (need_slash) out[pos++] = '/';
+    memcpy(out + pos, name, nlen);
+    pos += nlen;
+    out[pos] = '\0';
+    return out;
+}
+
+static char *cfg_test_strdup(const char *s) {
+    size_t n = strlen(s);
+    char *p = malloc(n + 1);
+    if (p) memcpy(p, s, n + 1);
+    return p;
+}
+
+static void cfg_test_mkdir_p(const char *path) {
+    char *tmp = cfg_test_strdup(path);
+    if (!tmp) return;
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = '\0';
+        mkdir(tmp, 0700);
+        *p = '/';
+    }
+    mkdir(tmp, 0700);
+    free(tmp);
+}
+
+static void cfg_test_write_file(const char *path, const char *content) {
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return;
+    fwrite(content, 1, strlen(content), fp);
+    fclose(fp);
+}
+
+static void cfg_test_rmtree(const char *path) {
+    struct stat st;
+    if (lstat(path, &st) != 0) return;
+    if (S_ISDIR(st.st_mode)) {
+        DIR *d = opendir(path);
+        if (d) {
+            struct dirent *de;
+            while ((de = readdir(d)) != NULL) {
+                if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+                char *child = cfg_test_join(path, de->d_name);
+                if (child) {
+                    cfg_test_rmtree(child);
+                    free(child);
+                }
+            }
+            closedir(d);
+        }
+        rmdir(path);
+    } else {
+        unlink(path);
+    }
+}
+
+static void cfg_test_setenv_home(const char *value, char **saved_out) {
+    const char *cur = getenv("HOME");
+    *saved_out = cur ? cfg_test_strdup(cur) : NULL;
+    if (value) setenv("HOME", value, 1);
+    else unsetenv("HOME");
+}
+
+static void cfg_test_restore_home(char *saved) {
+    if (saved) {
+        setenv("HOME", saved, 1);
+        free(saved);
+    } else {
+        unsetenv("HOME");
+    }
+}
+
+/* ---- test groups ---- */
+
+static void test_root_discovery(void) {
+    char tmpl[] = "/tmp/ds4_cfg_root_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    CFG_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    /* .ds4 directory marker, start 3 levels below */
+    char *proj_a = cfg_test_join(fx, "projA");
+    char *proj_a_ds4 = cfg_test_join(proj_a, ".ds4");
+    char *start_a = cfg_test_join(proj_a, "x/y/z");
+    cfg_test_mkdir_p(proj_a_ds4);
+    cfg_test_mkdir_p(start_a);
+    char resolved_a[PATH_MAX];
+    CFG_TEST_ASSERT(realpath(proj_a, resolved_a) != NULL);
+
+    ds4_config *c = ds4_config_load(start_a, NULL, 0);
+    CFG_TEST_ASSERT(c != NULL);
+    if (c) {
+        const char *root = ds4_config_project_root(c);
+        CFG_TEST_ASSERT(root != NULL);
+        if (root) CFG_TEST_ASSERT(strcmp(root, resolved_a) == 0);
+    }
+    ds4_config_free(c);
+
+    /* .git directory marker */
+    char *proj_b = cfg_test_join(fx, "projB");
+    char *proj_b_git = cfg_test_join(proj_b, ".git");
+    char *start_b = cfg_test_join(proj_b, "x/y/z");
+    cfg_test_mkdir_p(proj_b_git);
+    cfg_test_mkdir_p(start_b);
+    char resolved_b[PATH_MAX];
+    CFG_TEST_ASSERT(realpath(proj_b, resolved_b) != NULL);
+
+    c = ds4_config_load(start_b, NULL, 0);
+    CFG_TEST_ASSERT(c != NULL);
+    if (c) {
+        const char *root = ds4_config_project_root(c);
+        CFG_TEST_ASSERT(root != NULL);
+        if (root) CFG_TEST_ASSERT(strcmp(root, resolved_b) == 0);
+    }
+    ds4_config_free(c);
+
+    /* .git as a plain FILE (worktree case) */
+    char *proj_c = cfg_test_join(fx, "projC");
+    char *start_c = cfg_test_join(proj_c, "x/y/z");
+    cfg_test_mkdir_p(start_c);
+    char *proj_c_git = cfg_test_join(proj_c, ".git");
+    cfg_test_write_file(proj_c_git, "gitdir: ../somewhere\n");
+    char resolved_c[PATH_MAX];
+    CFG_TEST_ASSERT(realpath(proj_c, resolved_c) != NULL);
+
+    c = ds4_config_load(start_c, NULL, 0);
+    CFG_TEST_ASSERT(c != NULL);
+    if (c) {
+        const char *root = ds4_config_project_root(c);
+        CFG_TEST_ASSERT(root != NULL);
+        if (root) CFG_TEST_ASSERT(strcmp(root, resolved_c) == 0);
+    }
+    ds4_config_free(c);
+
+    /* nested project: inner .ds4 shadows outer, from inner start */
+    char *outer = cfg_test_join(fx, "outer");
+    char *outer_ds4 = cfg_test_join(outer, ".ds4");
+    char *inner = cfg_test_join(outer, "inner");
+    char *inner_ds4 = cfg_test_join(inner, ".ds4");
+    char *start_inner = cfg_test_join(inner, "p/q");
+    cfg_test_mkdir_p(outer_ds4);
+    cfg_test_mkdir_p(inner_ds4);
+    cfg_test_mkdir_p(start_inner);
+    char resolved_inner[PATH_MAX];
+    CFG_TEST_ASSERT(realpath(inner, resolved_inner) != NULL);
+
+    c = ds4_config_load(start_inner, NULL, 0);
+    CFG_TEST_ASSERT(c != NULL);
+    if (c) {
+        const char *root = ds4_config_project_root(c);
+        CFG_TEST_ASSERT(root != NULL);
+        if (root) CFG_TEST_ASSERT(strcmp(root, resolved_inner) == 0);
+    }
+    ds4_config_free(c);
+
+    free(proj_a); free(proj_a_ds4); free(start_a);
+    free(proj_b); free(proj_b_git); free(start_b);
+    free(proj_c); free(start_c); free(proj_c_git);
+    free(outer); free(outer_ds4); free(inner); free(inner_ds4); free(start_inner);
+    cfg_test_rmtree(fx);
+}
+
+static void test_no_marker_project_root(void) {
+    char tmpl[] = "/tmp/ds4_cfg_nomark_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    CFG_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    char *home = cfg_test_join(fx, "home");
+    char *start = cfg_test_join(fx, "a/b/c");
+    cfg_test_mkdir_p(home);
+    cfg_test_mkdir_p(start);
+
+    char *saved_home;
+    cfg_test_setenv_home(home, &saved_home);
+
+    ds4_config *c = ds4_config_load(start, NULL, 0);
+    CFG_TEST_ASSERT(c != NULL);
+    if (c) {
+        /* Deterministic regardless of what's above the fixture: HOME is set,
+         * so the user side must always resolve. Only the project-root walk
+         * is realpath-normalized, so this must match $HOME verbatim. */
+        const char *udir = ds4_config_user_ds4_dir(c);
+        CFG_TEST_ASSERT(udir != NULL);
+        if (udir) {
+            char expected[PATH_MAX + 8];
+            snprintf(expected, sizeof(expected), "%s/.ds4", home);
+            CFG_TEST_ASSERT(strcmp(udir, expected) == 0);
+        }
+        /* Project side: no marker exists inside the fixture, but walking up
+         * could in principle escape into the real filesystem, so only assert
+         * the accessor invariant rather than a specific NULL/non-NULL value. */
+        const char *root = ds4_config_project_root(c);
+        const char *pdir = ds4_config_project_ds4_dir(c);
+        CFG_TEST_ASSERT((root == NULL) == (pdir == NULL));
+    }
+    ds4_config_free(c);
+
+    cfg_test_restore_home(saved_home);
+    free(home); free(start);
+    cfg_test_rmtree(fx);
+}
+
+static void test_settings_merge(void) {
+    char tmpl[] = "/tmp/ds4_cfg_merge_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    CFG_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    char *proj = cfg_test_join(fx, "proj");
+    char *proj_ds4 = cfg_test_join(proj, ".ds4");
+    char *proj_settings = cfg_test_join(proj_ds4, "settings.json");
+    cfg_test_mkdir_p(proj_ds4);
+    cfg_test_write_file(proj_settings, "{\"a\":1,\"perm\":{\"x\":true}}");
+
+    char *home = cfg_test_join(fx, "home");
+    char *home_ds4 = cfg_test_join(home, ".ds4");
+    char *home_settings = cfg_test_join(home_ds4, "settings.json");
+    cfg_test_mkdir_p(home_ds4);
+    cfg_test_write_file(home_settings, "{\"a\":2,\"b\":3}");
+
+    char *saved_home;
+    cfg_test_setenv_home(home, &saved_home);
+
+    char warn[256] = {0};
+    ds4_config *c = ds4_config_load(proj, warn, sizeof(warn));
+    CFG_TEST_ASSERT(c != NULL);
+    if (c) {
+        CFG_TEST_ASSERT(ds4_json_num(ds4_config_get(c, "a"), -1) == 1.0);
+        CFG_TEST_ASSERT(ds4_json_num(ds4_config_get(c, "b"), -1) == 3.0);
+        const ds4_json_value *perm = ds4_config_get(c, "perm");
+        CFG_TEST_ASSERT(perm != NULL);
+        CFG_TEST_ASSERT(ds4_json_bool(ds4_json_obj_get(perm, "x"), false) == true);
+        CFG_TEST_ASSERT(ds4_config_get(c, "absent-key") == NULL);
+    }
+    ds4_config_free(c);
+
+    cfg_test_restore_home(saved_home);
+    free(proj); free(proj_ds4); free(proj_settings);
+    free(home); free(home_ds4); free(home_settings);
+    cfg_test_rmtree(fx);
+}
+
+static void test_missing_and_malformed_settings(void) {
+    char tmpl[] = "/tmp/ds4_cfg_missing_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    CFG_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    /* missing settings files entirely -> empty config, empty warn */
+    char *proj1 = cfg_test_join(fx, "proj1");
+    char *proj1_ds4 = cfg_test_join(proj1, ".ds4");
+    cfg_test_mkdir_p(proj1_ds4);
+
+    char *home1 = cfg_test_join(fx, "home1");
+    cfg_test_mkdir_p(home1);
+
+    char *saved_home;
+    cfg_test_setenv_home(home1, &saved_home);
+
+    char warn[256] = {0};
+    ds4_config *c = ds4_config_load(proj1, warn, sizeof(warn));
+    CFG_TEST_ASSERT(c != NULL);
+    CFG_TEST_ASSERT(warn[0] == '\0');
+    if (c) CFG_TEST_ASSERT(ds4_config_get(c, "anything") == NULL);
+    ds4_config_free(c);
+
+    /* malformed project settings.json -> skipped fail-open, warn non-empty,
+     * user settings still loaded */
+    char *proj2 = cfg_test_join(fx, "proj2");
+    char *proj2_ds4 = cfg_test_join(proj2, ".ds4");
+    char *proj2_settings = cfg_test_join(proj2_ds4, "settings.json");
+    cfg_test_mkdir_p(proj2_ds4);
+    cfg_test_write_file(proj2_settings, "{ not json");
+
+    char *home2 = cfg_test_join(fx, "home2");
+    char *home2_ds4 = cfg_test_join(home2, ".ds4");
+    char *home2_settings = cfg_test_join(home2_ds4, "settings.json");
+    cfg_test_mkdir_p(home2_ds4);
+    cfg_test_write_file(home2_settings, "{\"b\":5}");
+    setenv("HOME", home2, 1);
+
+    warn[0] = '\0';
+    c = ds4_config_load(proj2, warn, sizeof(warn));
+    CFG_TEST_ASSERT(c != NULL);
+    CFG_TEST_ASSERT(warn[0] != '\0');
+    if (c) {
+        CFG_TEST_ASSERT(ds4_config_get(c, "a") == NULL);
+        CFG_TEST_ASSERT(ds4_json_num(ds4_config_get(c, "b"), -1) == 5.0);
+    }
+    ds4_config_free(c);
+
+    cfg_test_restore_home(saved_home);
+    free(proj1); free(proj1_ds4); free(home1);
+    free(proj2); free(proj2_ds4); free(proj2_settings);
+    free(home2); free(home2_ds4); free(home2_settings);
+    cfg_test_rmtree(fx);
+}
+
+static void test_roots_listing(void) {
+    char tmpl[] = "/tmp/ds4_cfg_roots_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    CFG_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    char *proj = cfg_test_join(fx, "proj");
+    char *proj_ds4 = cfg_test_join(proj, ".ds4");
+    cfg_test_mkdir_p(proj_ds4);
+
+    char *home = cfg_test_join(fx, "home");
+    cfg_test_mkdir_p(home);
+
+    char *saved_home;
+    cfg_test_setenv_home(home, &saved_home);
+
+    ds4_config *c = ds4_config_load(proj, NULL, 0);
+    CFG_TEST_ASSERT(c != NULL);
+    if (c) {
+        CFG_TEST_ASSERT(ds4_config_root_count(c) == 2);
+        const char *r0 = ds4_config_root_at(c, 0);
+        const char *r1 = ds4_config_root_at(c, 1);
+        CFG_TEST_ASSERT(r0 != NULL && r0 == ds4_config_project_ds4_dir(c));
+        CFG_TEST_ASSERT(r1 != NULL && r1 == ds4_config_user_ds4_dir(c));
+        CFG_TEST_ASSERT(ds4_config_root_at(c, 2) == NULL);
+    }
+    ds4_config_free(c);
+
+    unsetenv("HOME");
+    c = ds4_config_load(proj, NULL, 0);
+    CFG_TEST_ASSERT(c != NULL);
+    if (c) {
+        CFG_TEST_ASSERT(ds4_config_root_count(c) == 1);
+        CFG_TEST_ASSERT(ds4_config_root_at(c, 0) == ds4_config_project_ds4_dir(c));
+        CFG_TEST_ASSERT(ds4_config_user_ds4_dir(c) == NULL);
+    }
+    ds4_config_free(c);
+
+    cfg_test_restore_home(saved_home);
+    free(proj); free(proj_ds4); free(home);
+    cfg_test_rmtree(fx);
+}
+
+static void test_neither_root_accessors(void) {
+    char tmpl[] = "/tmp/ds4_cfg_neither_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    CFG_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    char *start = cfg_test_join(fx, "solo");
+    cfg_test_mkdir_p(start);
+
+    char *saved_home;
+    cfg_test_setenv_home(NULL, &saved_home);
+
+    ds4_config *c = ds4_config_load(start, NULL, 0);
+    CFG_TEST_ASSERT(c != NULL);
+    if (c) {
+        CFG_TEST_ASSERT(ds4_config_user_ds4_dir(c) == NULL);
+        CFG_TEST_ASSERT(ds4_config_get(c, "totally-made-up-key-zzz") == NULL);
+        int expect_count = (ds4_config_project_ds4_dir(c) != NULL) ? 1 : 0;
+        CFG_TEST_ASSERT(ds4_config_root_count(c) == expect_count);
+        if (expect_count == 0) {
+            CFG_TEST_ASSERT(ds4_config_root_at(c, 0) == NULL);
+            CFG_TEST_ASSERT(ds4_config_project_root(c) == NULL);
+        } else {
+            CFG_TEST_ASSERT(ds4_config_root_at(c, 0) == ds4_config_project_ds4_dir(c));
+        }
+    }
+    ds4_config_free(c);
+
+    cfg_test_restore_home(saved_home);
+    free(start);
+    cfg_test_rmtree(fx);
+}
+
+int ds4_config_unit_tests_run(void) {
+    test_root_discovery();
+    test_no_marker_project_root();
+    test_settings_merge();
+    test_missing_and_malformed_settings();
+    test_roots_listing();
+    test_neither_root_accessors();
+    return cfg_test_failures;
+}
+#endif
