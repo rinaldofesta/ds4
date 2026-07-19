@@ -36,6 +36,9 @@ typedef enum { DS4_PERM_ALLOW, DS4_PERM_ASK } ds4_perm_decision;
 ds4_permissions *ds4_permissions_load(const ds4_config *cfg, char *warn, size_t warn_len);
 void ds4_permissions_free(ds4_permissions *p);
 
+int ds4_permissions_confirm_count(const ds4_permissions *p); /* 0 if p NULL */
+int ds4_permissions_allow_count(const ds4_permissions *p);   /* 0 if p NULL */
+
 /* Pure decision: ALLOW if p NULL, tool not in confirm, or an allow rule
  * matches (tool exact + fnmatch(pattern, subject)). ASK otherwise. */
 ds4_perm_decision ds4_permissions_check(const ds4_permissions *p,

@@ -142,6 +142,14 @@ void ds4_permissions_free(ds4_permissions *p) {
     free(p);
 }
 
+int ds4_permissions_confirm_count(const ds4_permissions *p) {
+    return p ? p->confirm_len : 0;
+}
+
+int ds4_permissions_allow_count(const ds4_permissions *p) {
+    return p ? p->allow_len : 0;
+}
+
 ds4_perm_decision ds4_permissions_check(const ds4_permissions *p,
                                         const char *tool, const char *subject) {
     if (!p) return DS4_PERM_ALLOW;
@@ -305,8 +313,12 @@ static void test_no_permissions_key(void) {
         ds4_permissions *p = ds4_permissions_load(cfg, warn, sizeof(warn));
         PERMS_TEST_ASSERT(p == NULL);
         PERMS_TEST_ASSERT(ds4_permissions_check(p, "bash", "anything") == DS4_PERM_ALLOW);
+        PERMS_TEST_ASSERT(ds4_permissions_confirm_count(p) == 0);
+        PERMS_TEST_ASSERT(ds4_permissions_allow_count(p) == 0);
     }
     PERMS_TEST_ASSERT(ds4_permissions_check(NULL, "bash", "anything") == DS4_PERM_ALLOW);
+    PERMS_TEST_ASSERT(ds4_permissions_confirm_count(NULL) == 0);
+    PERMS_TEST_ASSERT(ds4_permissions_allow_count(NULL) == 0);
     ds4_config_free(cfg);
     pmt_teardown(fx, home, saved_home);
 }
@@ -326,6 +338,8 @@ static void test_confirm_gating(void) {
             PERMS_TEST_ASSERT(ds4_permissions_check(p, "bash", "make test") == DS4_PERM_ASK);
             /* Not in confirm -> ALLOW regardless of subject. */
             PERMS_TEST_ASSERT(ds4_permissions_check(p, "edit", "anything") == DS4_PERM_ALLOW);
+            PERMS_TEST_ASSERT(ds4_permissions_confirm_count(p) == 2);
+            PERMS_TEST_ASSERT(ds4_permissions_allow_count(p) == 0);
             ds4_permissions_free(p);
         }
     }
@@ -351,6 +365,8 @@ static void test_allow_patterns(void) {
                 PERMS_TEST_ASSERT(ds4_permissions_check(p, "bash", "rm -rf /") == DS4_PERM_ASK);
                 PERMS_TEST_ASSERT(ds4_permissions_check(p, "write", "README.md") == DS4_PERM_ALLOW);
                 PERMS_TEST_ASSERT(ds4_permissions_check(p, "write", "notes.txt") == DS4_PERM_ASK);
+                PERMS_TEST_ASSERT(ds4_permissions_confirm_count(p) == 2);
+                PERMS_TEST_ASSERT(ds4_permissions_allow_count(p) == 2);
                 ds4_permissions_free(p);
             }
         }

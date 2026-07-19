@@ -502,11 +502,15 @@ static bool agent_slash_command_known(const char *cmd) {
         !strcmp(cmd, "/quit") ||
         !strcmp(cmd, "/exit") ||
         !strcmp(cmd, "/new") ||
+        !strcmp(cmd, "/commands") ||
+        !strcmp(cmd, "/memory") ||
+        !strcmp(cmd, "/config") ||
         agent_slash_command_with_args(cmd, "/power") ||
         agent_slash_command_with_args(cmd, "/switch") ||
         agent_slash_command_with_args(cmd, "/del") ||
         agent_slash_command_with_args(cmd, "/strip") ||
-        agent_slash_command_with_args(cmd, "/history"))
+        agent_slash_command_with_args(cmd, "/history") ||
+        agent_slash_command_with_args(cmd, "/skills"))
         return true;
 
     /* cmd is the whole trimmed input line here, not just the command word --
@@ -6620,6 +6624,15 @@ static void test_agent_edit_upto_requires_tail_after_newline_strip(void) {
 static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *call);
 static const char *agent_tool_call_subject(const agent_tool_call *call);
 
+/* Forward declared: defined later in the file (introspection renderers for
+ * /skills, /commands, /memory, /config), needed here so these tests can
+ * drive them ahead of their definition. Each returns malloc'd text, never
+ * NULL; the REPL branches just print it (see run_agent's dispatch chain). */
+static char *agent_render_skills(agent_worker *w, const char *arg);
+static char *agent_render_commands(agent_worker *w, const char *arg);
+static char *agent_render_memory(agent_worker *w, const char *arg);
+static char *agent_render_config(agent_worker *w, const char *arg);
+
 static void test_agent_tool_skill_dispatch(void) {
     char tmpl[] = "/tmp/ds4_agent_skill_dispatch_test.XXXXXX";
     char *fx = mkdtemp(tmpl);
@@ -7028,6 +7041,344 @@ static void test_agent_project_memory_load(void) {
     rmdir(fx);
 }
 
+/* agent_render_skills renders the /skills catalog (name, description, and
+ * which config root each skill came from, including a plugin tag) or, when
+ * given a name, that skill's full SKILL.md body. Uses a real ds4_config +
+ * ds4_skills_scan over an on-disk fixture (one skill in the project root,
+ * one in a project plugin root) so root/plugin tagging exercises real
+ * precedence data rather than hand-fabricated dirs. */
+static void test_agent_render_skills_catalog_and_body(void) {
+    char tmpl[] = "/tmp/ds4_agent_render_skills_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    AGENT_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    char proj[PATH_MAX], home[PATH_MAX];
+    snprintf(proj, sizeof(proj), "%s/proj", fx);
+    snprintf(home, sizeof(home), "%s/home", fx);
+
+    char alpha_dir[PATH_MAX], beta_dir[PATH_MAX];
+    snprintf(alpha_dir, sizeof(alpha_dir), "%s/.ds4/skills/alpha", proj);
+    snprintf(beta_dir, sizeof(beta_dir), "%s/.ds4/plugins/myplug/skills/beta", proj);
+    AGENT_TEST_ASSERT(agent_mkdir_p(alpha_dir));
+    AGENT_TEST_ASSERT(agent_mkdir_p(beta_dir));
+    AGENT_TEST_ASSERT(agent_mkdir_p(home));
+
+    char alpha_md[PATH_MAX], beta_md[PATH_MAX];
+    snprintf(alpha_md, sizeof(alpha_md), "%s/SKILL.md", alpha_dir);
+    snprintf(beta_md, sizeof(beta_md), "%s/SKILL.md", beta_dir);
+    FILE *fp = fopen(alpha_md, "wb");
+    AGENT_TEST_ASSERT(fp != NULL);
+    if (fp) { fputs("---\nname: alpha\ndescription: Alpha skill.\n---\nAlpha body text.\n", fp); fclose(fp); }
+    fp = fopen(beta_md, "wb");
+    AGENT_TEST_ASSERT(fp != NULL);
+    if (fp) { fputs("---\nname: beta\ndescription: Beta skill.\n---\nBeta body text.\n", fp); fclose(fp); }
+
+    const char *home_save_val = getenv("HOME");
+    char *home_save = home_save_val ? xstrdup(home_save_val) : NULL;
+    setenv("HOME", home, 1);
+
+    char warn[512] = {0};
+    ds4_config *cfg = ds4_config_load(proj, warn, sizeof(warn));
+    AGENT_TEST_ASSERT(cfg != NULL);
+
+    agent_worker w = {0};
+    w.config = cfg;
+    ds4_skills_scan(cfg, &w.skills, warn, sizeof(warn));
+    AGENT_TEST_ASSERT(w.skills.len == 2);
+
+    if (home_save) { setenv("HOME", home_save, 1); free(home_save); }
+    else unsetenv("HOME");
+
+    char *catalog = agent_render_skills(&w, "");
+    AGENT_TEST_ASSERT(catalog != NULL);
+    if (catalog) {
+        char expect_alpha[PATH_MAX + 64];
+        snprintf(expect_alpha, sizeof(expect_alpha), "alpha \xe2\x80\x94 Alpha skill.  (root: %s)",
+                 ds4_config_project_ds4_dir(cfg));
+        AGENT_TEST_ASSERT(strstr(catalog, expect_alpha) != NULL);
+
+        char expect_beta[PATH_MAX + 64];
+        snprintf(expect_beta, sizeof(expect_beta),
+                 "beta \xe2\x80\x94 Beta skill.  (root: %s/plugins/myplug [plugin myplug])",
+                 ds4_config_project_ds4_dir(cfg));
+        AGENT_TEST_ASSERT(strstr(catalog, expect_beta) != NULL);
+    }
+    free(catalog);
+
+    char *body = agent_render_skills(&w, "alpha");
+    AGENT_TEST_ASSERT(body != NULL);
+    if (body) AGENT_TEST_ASSERT(strstr(body, "Alpha body text.") != NULL);
+    free(body);
+
+    char *unknown = agent_render_skills(&w, "nope");
+    AGENT_TEST_ASSERT(unknown != NULL);
+    if (unknown) AGENT_TEST_ASSERT(strstr(unknown, "No such skill: nope") != NULL);
+    free(unknown);
+
+    /* Empty catalog: a separate, otherwise-zeroed worker. The empty branch
+     * returns before ever touching w->config, so this is safe with config
+     * left NULL. */
+    agent_worker empty_w = {0};
+    char *hint = agent_render_skills(&empty_w, "");
+    AGENT_TEST_ASSERT(hint != NULL);
+    if (hint)
+        AGENT_TEST_ASSERT(strstr(hint, "No skills configured. Add .ds4/skills/<name>/SKILL.md "
+                                        "to this project or ~/.ds4/skills/.") != NULL);
+    free(hint);
+
+    ds4_skills_list_free(&w.skills);
+    ds4_config_free(cfg);
+}
+
+/* agent_render_commands is a thin renderer over the file-scope
+ * g_agent_commands list (same seam agent_slash_command_known reads); no
+ * agent_worker state is involved. Defensively resets g_agent_commands to
+ * zero first so this test's "empty" assertion doesn't depend on running
+ * after test_agent_slash_command_known_file_commands's own cleanup. */
+static void test_agent_render_commands_list_and_empty(void) {
+    ds4_commands_list_free(&g_agent_commands);
+    agent_worker w = {0};
+
+    char *hint = agent_render_commands(&w, "");
+    AGENT_TEST_ASSERT(hint != NULL);
+    if (hint)
+        AGENT_TEST_ASSERT(strstr(hint, "No commands configured. Add .ds4/commands/<name>.md "
+                                        "to this project or ~/.ds4/commands/.") != NULL);
+    free(hint);
+
+    g_agent_commands.v = xmalloc(sizeof(ds4_command_meta));
+    g_agent_commands.len = 1;
+    g_agent_commands.cap = 1;
+    g_agent_commands.v[0].name = xstrdup("review");
+    g_agent_commands.v[0].path = xstrdup("/nonexistent/review.md");
+
+    char *listing = agent_render_commands(&w, "");
+    AGENT_TEST_ASSERT(listing != NULL);
+    if (listing) AGENT_TEST_ASSERT(strstr(listing, "/review  (/nonexistent/review.md)") != NULL);
+    free(listing);
+
+    ds4_commands_list_free(&g_agent_commands);
+}
+
+/* agent_render_memory: loaded text (header with path+byte count, then the
+ * full body) versus the no-memory-file hint. Reuses the exact
+ * agent_load_project_memory_text fixture pattern test_agent_project_memory_load
+ * already established. */
+static void test_agent_render_memory_loaded_and_absent(void) {
+    char tmpl[] = "/tmp/ds4_agent_render_memory_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    AGENT_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    char agents_path[PATH_MAX];
+    snprintf(agents_path, sizeof(agents_path), "%s/AGENTS.md", fx);
+    FILE *fp = fopen(agents_path, "wb");
+    AGENT_TEST_ASSERT(fp != NULL);
+    if (fp) { fputs("Use tabs, not spaces.\n", fp); fclose(fp); }
+
+    ds4_config *cfg = ds4_config_load(fx, NULL, 0);
+    AGENT_TEST_ASSERT(cfg != NULL);
+
+    agent_worker w = {0};
+    w.config = cfg;
+    char warn[256] = {0};
+    w.project_memory_text = agent_load_project_memory_text(cfg, warn, sizeof(warn));
+    AGENT_TEST_ASSERT(w.project_memory_text != NULL);
+
+    char *rendered = agent_render_memory(&w, "");
+    AGENT_TEST_ASSERT(rendered != NULL);
+    if (rendered) {
+        char expect_header[PATH_MAX + 64];
+        snprintf(expect_header, sizeof(expect_header), "Project memory: %s (%zu bytes)",
+                 ds4_config_memory_path(cfg), strlen(w.project_memory_text));
+        AGENT_TEST_ASSERT(strstr(rendered, expect_header) != NULL);
+        AGENT_TEST_ASSERT(strstr(rendered, "Use tabs, not spaces.\n") != NULL);
+    }
+    free(rendered);
+    free(w.project_memory_text);
+    ds4_config_free(cfg);
+
+    agent_worker w_none = {0};
+    char *hint = agent_render_memory(&w_none, "");
+    AGENT_TEST_ASSERT(hint != NULL);
+    if (hint) AGENT_TEST_ASSERT(strstr(hint, "No project memory (AGENTS.md or DS4.md) found.") != NULL);
+    free(hint);
+
+    unlink(agents_path);
+    rmdir(fx);
+}
+
+/* agent_render_config exercises real ds4_config/ds4_hooks/ds4_permissions
+ * fixtures -- project root plus a project plugin root, an isolated user
+ * root, and a settings.json key ("a") present in both scopes to prove
+ * project-wins provenance -- plus a manually populated command list and a
+ * loaded memory file, to check every section of the /config output. */
+static void test_agent_render_config_full(void) {
+    char tmpl[] = "/tmp/ds4_agent_render_config_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    AGENT_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    char proj[PATH_MAX], home[PATH_MAX];
+    snprintf(proj, sizeof(proj), "%s/proj", fx);
+    snprintf(home, sizeof(home), "%s/home", fx);
+
+    char proj_ds4[PATH_MAX], proj_settings[PATH_MAX];
+    snprintf(proj_ds4, sizeof(proj_ds4), "%s/.ds4", proj);
+    snprintf(proj_settings, sizeof(proj_settings), "%s/settings.json", proj_ds4);
+    AGENT_TEST_ASSERT(agent_mkdir_p(proj_ds4));
+    FILE *fp = fopen(proj_settings, "wb");
+    AGENT_TEST_ASSERT(fp != NULL);
+    if (fp) {
+        fputs("{\"a\":1,\"hooks\":{\"PreToolUse\":[{\"matcher\":\"*\",\"command\":\"true\"}]},"
+              "\"permissions\":{\"confirm\":[\"bash\"]}}", fp);
+        fclose(fp);
+    }
+
+    char plug_dir[PATH_MAX];
+    snprintf(plug_dir, sizeof(plug_dir), "%s/plugins/myplug", proj_ds4);
+    AGENT_TEST_ASSERT(agent_mkdir_p(plug_dir));
+
+    char home_ds4[PATH_MAX], home_settings[PATH_MAX];
+    snprintf(home_ds4, sizeof(home_ds4), "%s/.ds4", home);
+    snprintf(home_settings, sizeof(home_settings), "%s/settings.json", home_ds4);
+    AGENT_TEST_ASSERT(agent_mkdir_p(home_ds4));
+    fp = fopen(home_settings, "wb");
+    AGENT_TEST_ASSERT(fp != NULL);
+    if (fp) { fputs("{\"a\":99,\"b\":2}", fp); fclose(fp); }
+
+    char agents_path[PATH_MAX];
+    snprintf(agents_path, sizeof(agents_path), "%s/AGENTS.md", proj);
+    fp = fopen(agents_path, "wb");
+    AGENT_TEST_ASSERT(fp != NULL);
+    if (fp) { fputs("Project notes.\n", fp); fclose(fp); }
+
+    const char *home_save_val = getenv("HOME");
+    char *home_save = home_save_val ? xstrdup(home_save_val) : NULL;
+    setenv("HOME", home, 1);
+
+    char warn[512] = {0};
+    ds4_config *cfg = ds4_config_load(proj, warn, sizeof(warn));
+    AGENT_TEST_ASSERT(cfg != NULL);
+    AGENT_TEST_ASSERT(ds4_config_root_count(cfg) == 3); /* proj .ds4, proj plugin, home .ds4 */
+
+    ds4_hooks *hooks = ds4_hooks_load(cfg, warn, sizeof(warn));
+    AGENT_TEST_ASSERT(hooks != NULL);
+    ds4_permissions *perms = ds4_permissions_load(cfg, warn, sizeof(warn));
+    AGENT_TEST_ASSERT(perms != NULL);
+
+    if (home_save) { setenv("HOME", home_save, 1); free(home_save); }
+    else unsetenv("HOME");
+
+    agent_worker w = {0};
+    w.config = cfg;
+    w.hooks = hooks;
+    w.perms = perms;
+    w.project_memory_text = agent_load_project_memory_text(cfg, warn, sizeof(warn));
+    AGENT_TEST_ASSERT(w.project_memory_text != NULL);
+
+    /* Reset defensively (see test_agent_render_commands_list_and_empty) so
+     * "user commands: 1" below is a real assertion, not an accident of
+     * whatever order the test suite happens to run in. */
+    ds4_commands_list_free(&g_agent_commands);
+    g_agent_commands.v = xmalloc(sizeof(ds4_command_meta));
+    g_agent_commands.len = 1;
+    g_agent_commands.cap = 1;
+    g_agent_commands.v[0].name = xstrdup("review");
+    g_agent_commands.v[0].path = xstrdup("/nonexistent/review.md");
+
+    char *rendered = agent_render_config(&w, "");
+    AGENT_TEST_ASSERT(rendered != NULL);
+    if (rendered) {
+        char line[PATH_MAX + 64];
+        const char *proot = ds4_config_project_root(cfg);
+        const char *pds4 = ds4_config_project_ds4_dir(cfg);
+        const char *uds4 = ds4_config_user_ds4_dir(cfg);
+
+        snprintf(line, sizeof(line), "Project root: %s", proot);
+        AGENT_TEST_ASSERT(strstr(rendered, line) != NULL);
+
+        snprintf(line, sizeof(line), ".ds4 dir: %s", pds4);
+        AGENT_TEST_ASSERT(strstr(rendered, line) != NULL);
+
+        snprintf(line, sizeof(line), "%s  [project]", pds4);
+        AGENT_TEST_ASSERT(strstr(rendered, line) != NULL);
+
+        AGENT_TEST_ASSERT(ds4_config_root_is_plugin(cfg, 1));
+        snprintf(line, sizeof(line), "%s  [plugin myplug of project]", ds4_config_root_at(cfg, 1));
+        AGENT_TEST_ASSERT(strstr(rendered, line) != NULL);
+
+        snprintf(line, sizeof(line), "%s  [user]", uds4);
+        AGENT_TEST_ASSERT(strstr(rendered, line) != NULL);
+
+        AGENT_TEST_ASSERT(strstr(rendered, "a: project") != NULL);
+        AGENT_TEST_ASSERT(strstr(rendered, "a: user") == NULL);
+        AGENT_TEST_ASSERT(strstr(rendered, "b: user") != NULL);
+
+        AGENT_TEST_ASSERT(strstr(rendered, "skills: 0") != NULL);
+        AGENT_TEST_ASSERT(strstr(rendered, "user commands: 1") != NULL);
+        AGENT_TEST_ASSERT(strstr(rendered, "MCP servers: 0 (tools 0)") != NULL);
+        AGENT_TEST_ASSERT(strstr(rendered, "hooks: pre 1, post 0") != NULL);
+        AGENT_TEST_ASSERT(strstr(rendered, "permissions: confirm 1, allow 0") != NULL);
+        AGENT_TEST_ASSERT(strstr(rendered, "memory file: yes") != NULL);
+    }
+    free(rendered);
+
+    ds4_commands_list_free(&g_agent_commands);
+    free(w.project_memory_text);
+    ds4_hooks_free(hooks);
+    ds4_permissions_free(perms);
+    ds4_config_free(cfg);
+
+    unlink(proj_settings);
+    unlink(home_settings);
+    unlink(agents_path);
+    rmdir(plug_dir);
+    char plugins_dir[PATH_MAX];
+    snprintf(plugins_dir, sizeof(plugins_dir), "%s/plugins", proj_ds4);
+    rmdir(plugins_dir);
+    rmdir(proj_ds4);
+    rmdir(home_ds4);
+    rmdir(proj);
+    rmdir(home);
+    rmdir(fx);
+}
+
+/* The "everything absent" counterpart: no project root, no HOME, so no
+ * search roots, no settings, no memory file at all. */
+static void test_agent_render_config_no_project(void) {
+    char tmpl[] = "/tmp/ds4_agent_render_config_none_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    AGENT_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    const char *home_save_val = getenv("HOME");
+    char *home_save = home_save_val ? xstrdup(home_save_val) : NULL;
+    unsetenv("HOME");
+
+    ds4_config *cfg = ds4_config_load(fx, NULL, 0);
+    AGENT_TEST_ASSERT(cfg != NULL);
+    AGENT_TEST_ASSERT(ds4_config_project_root(cfg) == NULL);
+
+    if (home_save) { setenv("HOME", home_save, 1); free(home_save); }
+
+    agent_worker w = {0};
+    w.config = cfg;
+    ds4_commands_list_free(&g_agent_commands); /* so "user commands: 0" holds */
+
+    char *rendered = agent_render_config(&w, "");
+    AGENT_TEST_ASSERT(rendered != NULL);
+    if (rendered) {
+        AGENT_TEST_ASSERT(strstr(rendered, "Project root: none") != NULL);
+        AGENT_TEST_ASSERT(strstr(rendered, ".ds4 dir: none") != NULL);
+        AGENT_TEST_ASSERT(strstr(rendered, "memory file: no") != NULL);
+    }
+    free(rendered);
+    ds4_config_free(cfg);
+    rmdir(fx);
+}
+
 /* agent_flags_conflict() is a pure function of agent_config -- no worker, no
  * engine -- so the --continue/--resume mutual exclusion check is testable
  * directly: both set is a conflict, either alone or neither is not. */
@@ -7330,6 +7681,11 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_tool_call_subject_extraction();
     test_agent_permission_gate();
     test_agent_project_memory_load();
+    test_agent_render_skills_catalog_and_body();
+    test_agent_render_commands_list_and_empty();
+    test_agent_render_memory_loaded_and_absent();
+    test_agent_render_config_full();
+    test_agent_render_config_no_project();
     test_agent_flags_conflict();
     test_agent_parse_options_resume_flags();
     test_agent_session_list_query_empty_or_missing_dir();
@@ -10804,12 +11160,214 @@ static void editor_cancel_input_with_hint(agent_editor *ed,
     editor_write_async(ed, msg, strlen(msg), prompt, status, true);
 }
 
+/* ============================================================================
+ * Introspection Renderers: /skills, /commands, /memory, /config
+ * ============================================================================
+ * Read-only, instant, model-free -- each renders a slice of the harness state
+ * already loaded onto agent_worker (or, for user commands, the file-scope
+ * g_agent_commands list) into a malloc'd, NUL-terminated string. Never NULL.
+ * The REPL dispatch chain (run_agent) just prints the result; factoring the
+ * text-building out like this is what makes these commands unit-testable
+ * without a REPL loop, an engine, or a model. */
+
+/* Finds which ds4_config search root a scanned skill belongs to (skill dirs
+ * are always "<root>/skills/<name>") and formats "<root path>", or "<root
+ * path> [plugin <name>]" when that root is a plugin root. Falls back to the
+ * skill's own dir if, somehow, no root matches (should not happen for a dir
+ * ds4_skills_scan itself produced). */
+static void agent_format_skill_root(const ds4_config *cfg, const char *skill_dir,
+                                    char *out, size_t outlen) {
+    static const char skills_seg[] = "/skills/";
+    int nroots = ds4_config_root_count(cfg);
+    for (int i = 0; i < nroots; i++) {
+        const char *root = ds4_config_root_at(cfg, i);
+        if (!root) continue;
+        size_t rlen = strlen(root);
+        if (strncmp(skill_dir, root, rlen) != 0 || skill_dir[rlen] != '/')
+            continue;
+        if (strncmp(skill_dir + rlen, skills_seg, strlen(skills_seg)) != 0)
+            continue;
+        if (ds4_config_root_is_plugin(cfg, i)) {
+            snprintf(out, outlen, "%s [plugin %s]", root,
+                     ds4_config_root_plugin_name(cfg, i));
+        } else {
+            snprintf(out, outlen, "%s", root);
+        }
+        return;
+    }
+    snprintf(out, outlen, "%s", skill_dir);
+}
+
+/* /skills [name]: the full catalog (name, description, source root), or one
+ * skill's full SKILL.md body when a name is given. */
+static char *agent_render_skills(agent_worker *w, const char *arg) {
+    if (arg && arg[0]) {
+        char *body = ds4_skills_load_body(&w->skills, arg);
+        if (body) return body;
+        char *msg = xmalloc(strlen(arg) + 32);
+        sprintf(msg, "No such skill: %s\n", arg);
+        return msg;
+    }
+
+    if (w->skills.len == 0) {
+        return xstrdup("No skills configured. Add .ds4/skills/<name>/SKILL.md "
+                       "to this project or ~/.ds4/skills/.\n");
+    }
+
+    agent_input_buf buf = {0};
+    for (int i = 0; i < w->skills.len; i++) {
+        const ds4_skill_meta *s = &w->skills.v[i];
+        char root_desc[PATH_MAX + 64];
+        agent_format_skill_root(w->config, s->dir, root_desc, sizeof(root_desc));
+        char line[PATH_MAX + 512];
+        snprintf(line, sizeof(line), "%s \xe2\x80\x94 %s  (root: %s)\n",
+                 s->name, s->description, root_desc);
+        agent_input_buf_append(&buf, line, strlen(line));
+    }
+    return agent_input_buf_take(&buf);
+}
+
+/* /commands: user-defined slash commands discovered from the config search
+ * roots (g_agent_commands, populated once in agent_worker_init). */
+static char *agent_render_commands(agent_worker *w, const char *arg) {
+    (void)w;
+    (void)arg;
+    if (g_agent_commands.len == 0) {
+        return xstrdup("No commands configured. Add .ds4/commands/<name>.md "
+                       "to this project or ~/.ds4/commands/.\n");
+    }
+
+    agent_input_buf buf = {0};
+    for (int i = 0; i < g_agent_commands.len; i++) {
+        char line[PATH_MAX + 64];
+        snprintf(line, sizeof(line), "/%s  (%s)\n",
+                 g_agent_commands.v[i].name, g_agent_commands.v[i].path);
+        agent_input_buf_append(&buf, line, strlen(line));
+    }
+    return agent_input_buf_take(&buf);
+}
+
+/* /memory: the loaded project memory (AGENTS.md/DS4.md), header plus the
+ * full text, or a hint that none was found. */
+static char *agent_render_memory(agent_worker *w, const char *arg) {
+    (void)arg;
+    if (!w->project_memory_text) {
+        return xstrdup("No project memory (AGENTS.md or DS4.md) found.\n");
+    }
+
+    const char *path = ds4_config_memory_path(w->config);
+    size_t bytes = strlen(w->project_memory_text);
+    agent_input_buf buf = {0};
+    char header[PATH_MAX + 64];
+    snprintf(header, sizeof(header), "Project memory: %s (%zu bytes)\n\n", path, bytes);
+    agent_input_buf_append(&buf, header, strlen(header));
+    agent_input_buf_append(&buf, w->project_memory_text, bytes);
+    return agent_input_buf_take(&buf);
+}
+
+/* Appends one /config search-root line, tagged [project], [user], or
+ * [plugin <name> of project|user]. A plugin root is "of project" iff it
+ * falls under the project .ds4 dir (see ds4_config.h's root ordering: every
+ * plugin root is a child of exactly one of the two base roots). */
+static void agent_config_append_root_line(agent_input_buf *buf, const ds4_config *cfg, int i) {
+    const char *root = ds4_config_root_at(cfg, i);
+    const char *project_ds4 = ds4_config_project_ds4_dir(cfg);
+    const char *user_ds4 = ds4_config_user_ds4_dir(cfg);
+    char line[PATH_MAX + 64];
+
+    if (ds4_config_root_is_plugin(cfg, i)) {
+        const char *name = ds4_config_root_plugin_name(cfg, i);
+        size_t plen = project_ds4 ? strlen(project_ds4) : 0;
+        bool of_project = project_ds4 && !strncmp(root, project_ds4, plen) && root[plen] == '/';
+        snprintf(line, sizeof(line), "  %s  [plugin %s of %s]\n", root, name,
+                 of_project ? "project" : "user");
+    } else if (project_ds4 && !strcmp(root, project_ds4)) {
+        snprintf(line, sizeof(line), "  %s  [project]\n", root);
+    } else if (user_ds4 && !strcmp(root, user_ds4)) {
+        snprintf(line, sizeof(line), "  %s  [user]\n", root);
+    } else {
+        snprintf(line, sizeof(line), "  %s\n", root);
+    }
+    agent_input_buf_append(buf, line, strlen(line));
+}
+
+/* /config: effective harness configuration -- project root, search roots
+ * with provenance, settings.json keys with provenance, and a summary count
+ * of every other loaded module. */
+static char *agent_render_config(agent_worker *w, const char *arg) {
+    (void)arg;
+    const ds4_config *cfg = w->config;
+    agent_input_buf buf = {0};
+    char line[PATH_MAX + 128];
+
+    const char *proot = ds4_config_project_root(cfg);
+    snprintf(line, sizeof(line), "Project root: %s\n", proot ? proot : "none");
+    agent_input_buf_append(&buf, line, strlen(line));
+
+    const char *pds4 = ds4_config_project_ds4_dir(cfg);
+    snprintf(line, sizeof(line), ".ds4 dir: %s\n", pds4 ? pds4 : "none");
+    agent_input_buf_append(&buf, line, strlen(line));
+
+    agent_input_buf_append(&buf, "\nSearch roots (precedence order):\n",
+                           strlen("\nSearch roots (precedence order):\n"));
+    int nroots = ds4_config_root_count(cfg);
+    if (nroots == 0) {
+        agent_input_buf_append(&buf, "  (none)\n", strlen("  (none)\n"));
+    } else {
+        for (int i = 0; i < nroots; i++)
+            agent_config_append_root_line(&buf, cfg, i);
+    }
+
+    agent_input_buf_append(&buf, "\nSettings:\n", strlen("\nSettings:\n"));
+    const ds4_json_value *proj_settings = ds4_config_get_scoped(cfg, NULL, 0);
+    const ds4_json_value *user_settings = ds4_config_get_scoped(cfg, NULL, 1);
+    int pn = ds4_json_obj_len(proj_settings);
+    int un = ds4_json_obj_len(user_settings);
+    for (int i = 0; i < pn; i++) {
+        const char *k = ds4_json_obj_key_at(proj_settings, i);
+        snprintf(line, sizeof(line), "  %s: project\n", k);
+        agent_input_buf_append(&buf, line, strlen(line));
+    }
+    for (int i = 0; i < un; i++) {
+        const char *k = ds4_json_obj_key_at(user_settings, i);
+        if (ds4_config_get_scoped(cfg, k, 0)) continue; /* already listed as project */
+        snprintf(line, sizeof(line), "  %s: user\n", k);
+        agent_input_buf_append(&buf, line, strlen(line));
+    }
+    if (pn == 0 && un == 0)
+        agent_input_buf_append(&buf, "  (none)\n", strlen("  (none)\n"));
+
+    agent_input_buf_append(&buf, "\nCounts:\n", strlen("\nCounts:\n"));
+    snprintf(line, sizeof(line), "  skills: %d\n", w->skills.len);
+    agent_input_buf_append(&buf, line, strlen(line));
+    snprintf(line, sizeof(line), "  user commands: %d\n", g_agent_commands.len);
+    agent_input_buf_append(&buf, line, strlen(line));
+    snprintf(line, sizeof(line), "  MCP servers: %d (tools %d)\n",
+             ds4_mcp_registry_server_count(w->mcp), ds4_mcp_registry_tool_count(w->mcp));
+    agent_input_buf_append(&buf, line, strlen(line));
+    snprintf(line, sizeof(line), "  hooks: pre %d, post %d\n",
+             ds4_hooks_count(w->hooks, DS4_HOOK_PRE_TOOL),
+             ds4_hooks_count(w->hooks, DS4_HOOK_POST_TOOL));
+    agent_input_buf_append(&buf, line, strlen(line));
+    snprintf(line, sizeof(line), "  permissions: confirm %d, allow %d\n",
+             ds4_permissions_confirm_count(w->perms), ds4_permissions_allow_count(w->perms));
+    agent_input_buf_append(&buf, line, strlen(line));
+    snprintf(line, sizeof(line), "  memory file: %s\n", w->project_memory_text ? "yes" : "no");
+    agent_input_buf_append(&buf, line, strlen(line));
+
+    return agent_input_buf_take(&buf);
+}
+
 static void runtime_help(void) {
     puts("Commands:");
     puts("  /help        Show this help.");
     puts("  /save        Save the current session.");
     puts("  /compact     Compact the current session context now.");
     puts("  /list        List saved sessions.");
+    puts("  /skills      List skills; /skills <name> shows its full text.");
+    puts("  /commands    List user-defined slash commands.");
+    puts("  /memory      Show loaded project memory (AGENTS.md/DS4.md).");
+    puts("  /config      Show effective harness configuration.");
     puts("  /switch SHA  Load a saved session and show recent history.");
     puts("  /del SHA     Delete a saved session.");
     puts("  /strip SHA   Strip KV payload; /switch rebuilds it by prefill.");
@@ -11594,6 +12152,25 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                             worker_request_power(&worker, power);
                         }
                     }
+                } else if (!strcmp(cmd, "/commands")) {
+                    char *rendered = agent_render_commands(&worker, "");
+                    fputs(rendered, stdout);
+                    free(rendered);
+                } else if (!strcmp(cmd, "/memory")) {
+                    char *rendered = agent_render_memory(&worker, "");
+                    fputs(rendered, stdout);
+                    free(rendered);
+                } else if (!strcmp(cmd, "/config")) {
+                    char *rendered = agent_render_config(&worker, "");
+                    fputs(rendered, stdout);
+                    free(rendered);
+                } else if (!strncmp(cmd, "/skills", 7) &&
+                           (cmd[7] == '\0' || cmd[7] == ' ' || cmd[7] == '\t')) {
+                    char *arg = cmd + 7;
+                    while (*arg == ' ' || *arg == '\t') arg++;
+                    char *rendered = agent_render_skills(&worker, arg);
+                    fputs(rendered, stdout);
+                    free(rendered);
                 } else if (cmd[0] == '/' && !agent_slash_command_known(cmd)) {
                     ssize_t ignored = write(STDOUT_FILENO, "\a", 1);
                     (void)ignored;

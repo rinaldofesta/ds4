@@ -918,6 +918,10 @@ int ds4_mcp_registry_tool_count(const ds4_mcp_registry *reg) {
     return reg ? reg->tool_count : 0;
 }
 
+int ds4_mcp_registry_server_count(const ds4_mcp_registry *reg) {
+    return reg ? reg->proc_count : 0;
+}
+
 const ds4_mcp_tool *ds4_mcp_registry_tool_at(const ds4_mcp_registry *reg, int i) {
     if (!reg || i < 0 || i >= reg->tool_count) return NULL;
     return &reg->tools[i];
@@ -1242,6 +1246,7 @@ static void test_normal(void) {
         MCP_TEST_ASSERT(reg != NULL);
         if (reg) {
             MCP_TEST_ASSERT(ds4_mcp_registry_tool_count(reg) == 2);
+            MCP_TEST_ASSERT(ds4_mcp_registry_server_count(reg) == 1);
             /* The mock's tools/list response order is echo, add -- but the
              * registry sorts tools by wire_name after discovery so the
              * rendered prompt block is deterministic across runs regardless
@@ -1513,6 +1518,7 @@ static void test_no_config(void) {
         ds4_mcp_registry *reg = ds4_mcp_registry_create(cfg, NULL, warn, sizeof(warn));
         MCP_TEST_ASSERT(reg == NULL);
         MCP_TEST_ASSERT(ds4_mcp_registry_tool_count(reg) == 0);
+        MCP_TEST_ASSERT(ds4_mcp_registry_server_count(reg) == 0);
         MCP_TEST_ASSERT(ds4_mcp_registry_tool_at(reg, 0) == NULL);
         MCP_TEST_ASSERT(ds4_mcp_registry_find(reg, "mcp__mock__echo") == NULL);
         MCP_TEST_ASSERT(ds4_mcp_tools_prompt_text(reg) == NULL);

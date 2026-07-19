@@ -459,6 +459,13 @@ const ds4_json_value *ds4_config_get(const ds4_config *c, const char *key) {
     return ds4_json_obj_get(c->user_settings, key);
 }
 
+const ds4_json_value *ds4_config_get_scoped(const ds4_config *c, const char *key, int scope) {
+    if (!c) return NULL;
+    const ds4_json_value *root = (scope == 0) ? c->project_settings : c->user_settings;
+    if (!key) return root;
+    return ds4_json_obj_get(root, key);
+}
+
 int ds4_config_root_count(const ds4_config *c) {
     return c ? c->root_count : 0;
 }
@@ -735,7 +742,26 @@ static void test_settings_merge(void) {
         CFG_TEST_ASSERT(perm != NULL);
         CFG_TEST_ASSERT(ds4_json_bool(ds4_json_obj_get(perm, "x"), false) == true);
         CFG_TEST_ASSERT(ds4_config_get(c, "absent-key") == NULL);
+
+        /* ds4_config_get_scoped: per-scope lookup, no project-then-user
+         * fallback -- "b" exists only in user settings, so scope 0 (project)
+         * must not see it even though ds4_config_get (merged) does. */
+        CFG_TEST_ASSERT(ds4_json_num(ds4_config_get_scoped(c, "a", 0), -1) == 1.0);
+        CFG_TEST_ASSERT(ds4_json_num(ds4_config_get_scoped(c, "a", 1), -1) == 2.0);
+        CFG_TEST_ASSERT(ds4_config_get_scoped(c, "b", 0) == NULL);
+        CFG_TEST_ASSERT(ds4_json_num(ds4_config_get_scoped(c, "b", 1), -1) == 3.0);
+        CFG_TEST_ASSERT(ds4_config_get_scoped(c, "absent-key", 0) == NULL);
+        CFG_TEST_ASSERT(ds4_config_get_scoped(c, "absent-key", 1) == NULL);
+
+        /* key == NULL returns the whole scoped settings root, for enumeration
+         * (ds4_json_obj_len/ds4_json_obj_key_at) rather than a single value. */
+        const ds4_json_value *proot = ds4_config_get_scoped(c, NULL, 0);
+        const ds4_json_value *uroot = ds4_config_get_scoped(c, NULL, 1);
+        CFG_TEST_ASSERT(proot != NULL && ds4_json_obj_len(proot) == 2); /* a, perm */
+        CFG_TEST_ASSERT(uroot != NULL && ds4_json_obj_len(uroot) == 2); /* a, b */
     }
+    CFG_TEST_ASSERT(ds4_config_get_scoped(NULL, "a", 0) == NULL);
+    CFG_TEST_ASSERT(ds4_config_get_scoped(NULL, NULL, 0) == NULL);
     ds4_config_free(c);
 
     cfg_test_restore_home(saved_home);

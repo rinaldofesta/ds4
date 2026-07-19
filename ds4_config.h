@@ -39,6 +39,15 @@ char *ds4_config_read_capped_file(const char *path, char *warn, size_t warn_len)
  * key is absent from both. Returned pointer is owned by the config object. */
 const ds4_json_value *ds4_config_get(const ds4_config *c, const char *key);
 
+/* Scoped settings lookup, bypassing the project-then-user merge ds4_config_get
+ * performs: scope 0 = project settings.json only, scope 1 = user settings.json
+ * only. key non-NULL returns that key's value within just that scope (NULL if
+ * absent there, regardless of the other scope). key NULL returns the whole
+ * scoped settings root object instead (NULL if that scope has none) -- so
+ * callers can enumerate its keys via ds4_json_obj_len/ds4_json_obj_key_at,
+ * e.g. for provenance reporting. */
+const ds4_json_value *ds4_config_get_scoped(const ds4_config *c, const char *key, int scope);
+
 /* Search roots for content (skills/, commands/, mcp.json, hooks.json),
  * highest precedence first:
  *

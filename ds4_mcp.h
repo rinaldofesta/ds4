@@ -34,6 +34,7 @@ ds4_mcp_registry *ds4_mcp_registry_create(const ds4_config *cfg, const ds4_mcp_o
 void ds4_mcp_registry_free(ds4_mcp_registry *reg); /* SIGTERM children, brief grace, SIGKILL; reap */
 
 int ds4_mcp_registry_tool_count(const ds4_mcp_registry *reg);          /* 0 if reg NULL */
+int ds4_mcp_registry_server_count(const ds4_mcp_registry *reg);        /* 0 if reg NULL */
 const ds4_mcp_tool *ds4_mcp_registry_tool_at(const ds4_mcp_registry *reg, int i);
 const ds4_mcp_tool *ds4_mcp_registry_find(const ds4_mcp_registry *reg, const char *wire_name); /* NULL-reg tolerant */
 
