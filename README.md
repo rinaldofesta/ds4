@@ -544,6 +544,11 @@ This fork extends `ds4-agent` with a project/user configuration layer.
 All of it is strictly opt-in: with no `.ds4` directory, no memory file and
 no new flags, the agent behaves byte-identically to the base version.
 
+Metal shader sources also resolve relative to the executable (symlinks
+followed), so the agent can be launched from any project directory — or
+symlinked into your `PATH` — without `--chdir` and without falling back
+to the CPU backend.
+
 The agent looks for a project root by walking up from the current directory
 to the nearest ancestor containing `.ds4/` or `.git`, and also reads
 user-level configuration from `~/.ds4/`. Project entries win over user
