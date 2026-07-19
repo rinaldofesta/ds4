@@ -536,6 +536,7 @@ static bool agent_slash_command_known(const char *cmd) {
         !strcmp(cmd, "/model") ||
         !strcmp(cmd, "/permissions") ||
         !strcmp(cmd, "/hooks") ||
+        !strcmp(cmd, "/init") ||
         agent_slash_command_with_args(cmd, "/power") ||
         agent_slash_command_with_args(cmd, "/switch") ||
         agent_slash_command_with_args(cmd, "/del") ||
@@ -586,6 +587,7 @@ static const agent_builtin_command agent_builtin_commands[] = {
     { "model", false },
     { "permissions", false },
     { "hooks", false },
+    { "init", false },
     { "power", true },
     { "switch", true },
     { "del", true },
@@ -6789,6 +6791,31 @@ static bool agent_edit_find_old_span(const char *data, size_t len,
     return true;
 }
 
+/* /init's sentinel prefix and canned prompt: declared here, ahead of both
+ * the test block below (which asserts against them directly) and the real
+ * agent_init_prompt_or_error definition further down (see its own comment,
+ * right before runtime_help), rather than inside the DS4_AGENT_TEST guard
+ * that houses this file's other forward declarations -- unlike those
+ * declarations, these two are also needed by the non-test build's REPL
+ * dispatch arm, which the DS4_AGENT_TEST guard would hide from it.
+ * AGENT_INIT_ALREADY_PREFIX is the sentinel that lets a single-return-value
+ * function double as "prompt or error" (see agent_init_prompt_or_error's own
+ * comment): the canned prompt can never start with it, so a caller (REPL
+ * dispatch, tests) tells the two apart with one strncmp instead of a second
+ * return channel. AGENT_INIT_CANNED_PROMPT is the exact, static text /init
+ * submits as a user turn -- kept as a named constant rather than a literal
+ * buried in the dispatch arm so tests can assert against the very text that
+ * gets sent, not a paraphrase of it. */
+#define AGENT_INIT_ALREADY_PREFIX "already initialized: "
+static const char AGENT_INIT_CANNED_PROMPT[] =
+"Initialize this project's harness configuration. Do the following, using your tools:\n"
+"1. Briefly explore this repository: read the README (if any), the build files, and list the top-level structure. Do not read large files whole.\n"
+"2. Create the directory .ds4/skills/<slug>/ where <slug> is a short kebab-case name for this project's conventions.\n"
+"3. Write AGENTS.md at the project root: a concise (under 40 lines) project memory for a coding agent -- what the project is, how to build and test it, the code conventions that actually matter here. Only include facts you verified in step 1.\n"
+"4. Write .ds4/skills/<slug>/SKILL.md with frontmatter (name: <slug>, description: one line saying when to use it) and a body encoding the project's real conventions from step 1. If you found no meaningful conventions, write the skill about how to build and test instead.\n"
+"5. Write .ds4/settings.json.example and .ds4/mcp.json.example: small comment-free JSON examples of the permissions/hooks and mcpServers formats, each with a one-line '_note' key explaining that renaming the file to drop .example activates it.\n"
+"6. Do not create any other files. Do not modify existing files. When done, list what you created.";
+
 #ifdef DS4_AGENT_TEST
 static int agent_test_failures;
 
@@ -6869,6 +6896,14 @@ static char *agent_render_mcp(agent_worker *w);
 static char *agent_render_model(agent_worker *w, const char *arg);
 static char *agent_render_permissions(agent_worker *w, const char *arg);
 static char *agent_render_hooks(agent_worker *w, const char *arg);
+
+/* Forward declared: defined later in the file (right before runtime_help),
+ * needed here so /init's guard + prompt selection can be tested ahead of its
+ * definition, model-free, the same seam as the render_* family above.
+ * AGENT_INIT_ALREADY_PREFIX/AGENT_INIT_CANNED_PROMPT it relies on are
+ * declared above this test guard, not inside it -- see the comment there. */
+static char *agent_init_prompt_or_error(agent_worker *w);
+
 /* agent_think_mode_apply is NOT forward declared here: it's pure config
  * logic defined right next to effective_think_mode, well above this test
  * block, so it's already visible by this point. */
@@ -6967,6 +7002,15 @@ static void test_agent_slash_command_known_v2t3_commands(void) {
     AGENT_TEST_ASSERT(agent_slash_command_known("/allow bash make *"));
     AGENT_TEST_ASSERT(!agent_slash_command_known("/thinkfoo"));
     AGENT_TEST_ASSERT(!agent_slash_command_known("/allowlist"));
+}
+
+/* /init is exact-match, no-args (like /model/permissions/hooks above, not
+ * /think/allow's argument forms) -- the canned prompt takes no parameters,
+ * so "/init foo" must stay unknown rather than silently ignoring the arg. */
+static void test_agent_slash_command_known_init(void) {
+    AGENT_TEST_ASSERT(agent_slash_command_known("/init"));
+    AGENT_TEST_ASSERT(!agent_slash_command_known("/init foo"));
+    AGENT_TEST_ASSERT(!agent_slash_command_known("/initfoo"));
 }
 
 /* Drives the agent_execute_tool_call dispatch wrapper end to end: a real
@@ -7633,6 +7677,110 @@ static void test_agent_render_config_no_project(void) {
         AGENT_TEST_ASSERT(strstr(rendered, "memory file: no") != NULL);
     }
     free(rendered);
+    ds4_config_free(cfg);
+    rmdir(fx);
+}
+
+/* agent_init_prompt_or_error, /init's model-free guard: a project .ds4 dir
+ * that already exists on disk (not just a discoverable project root -- see
+ * the "no ds4 yet" case right below, which has a root but no .ds4) yields
+ * the "already initialized" message naming that exact path. */
+static void test_agent_init_prompt_or_error_already_initialized(void) {
+    char tmpl[] = "/tmp/ds4_agent_init_already_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    AGENT_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    char ds4_dir[PATH_MAX];
+    snprintf(ds4_dir, sizeof(ds4_dir), "%s/.ds4", fx);
+    AGENT_TEST_ASSERT(agent_mkdir_p(ds4_dir));
+
+    ds4_config *cfg = ds4_config_load(fx, NULL, 0);
+    AGENT_TEST_ASSERT(cfg != NULL);
+    AGENT_TEST_ASSERT(ds4_config_project_ds4_dir(cfg) != NULL);
+
+    agent_worker w = {0};
+    w.config = cfg;
+    char *result = agent_init_prompt_or_error(&w);
+    AGENT_TEST_ASSERT(result != NULL);
+    if (result) {
+        AGENT_TEST_ASSERT(!strncmp(result, AGENT_INIT_ALREADY_PREFIX,
+                                   strlen(AGENT_INIT_ALREADY_PREFIX)));
+        AGENT_TEST_ASSERT(strstr(result, ds4_dir) != NULL);
+    }
+    free(result);
+    ds4_config_free(cfg);
+    rmdir(ds4_dir);
+    rmdir(fx);
+}
+
+/* A discoverable project root (the .git marker) with no .ds4 dir yet: the
+ * guard must return the canned prompt verbatim, not the error branch --
+ * ds4_config_project_ds4_dir returns a path here even though nothing exists
+ * there yet (see its own header comment), so the guard's disk check is what
+ * actually matters, not merely whether that accessor returned non-NULL. */
+static void test_agent_init_prompt_or_error_no_ds4_yet(void) {
+    char tmpl[] = "/tmp/ds4_agent_init_no_ds4_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    AGENT_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    char git_dir[PATH_MAX];
+    snprintf(git_dir, sizeof(git_dir), "%s/.git", fx);
+    AGENT_TEST_ASSERT(agent_mkdir_p(git_dir));
+
+    ds4_config *cfg = ds4_config_load(fx, NULL, 0);
+    AGENT_TEST_ASSERT(cfg != NULL);
+    AGENT_TEST_ASSERT(ds4_config_project_root(cfg) != NULL);
+    const char *pds4 = ds4_config_project_ds4_dir(cfg);
+    AGENT_TEST_ASSERT(pds4 != NULL);
+    AGENT_TEST_ASSERT(access(pds4, F_OK) != 0); /* named but not created yet */
+
+    agent_worker w = {0};
+    w.config = cfg;
+    char *result = agent_init_prompt_or_error(&w);
+    AGENT_TEST_ASSERT(result != NULL);
+    if (result) {
+        AGENT_TEST_ASSERT(!strcmp(result, AGENT_INIT_CANNED_PROMPT));
+        AGENT_TEST_ASSERT(strstr(result, "AGENTS.md") != NULL);
+        AGENT_TEST_ASSERT(strstr(result, "SKILL.md") != NULL);
+        AGENT_TEST_ASSERT(strstr(result, ".example") != NULL);
+    }
+    free(result);
+    ds4_config_free(cfg);
+    rmdir(git_dir);
+    rmdir(fx);
+}
+
+/* No project root at all (same fixture idiom as
+ * test_agent_render_config_no_project): ds4_config_project_ds4_dir is NULL,
+ * so the guard must fall back to "<cwd>/.ds4" rather than crash or skip the
+ * disk check. Chdirs into the fixture so that fallback resolves under it,
+ * restoring the original cwd afterward regardless of outcome so later tests
+ * in this same process never see a moved cwd. */
+static void test_agent_init_prompt_or_error_no_project_root(void) {
+    char tmpl[] = "/tmp/ds4_agent_init_no_root_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    AGENT_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    ds4_config *cfg = ds4_config_load(fx, NULL, 0);
+    AGENT_TEST_ASSERT(cfg != NULL);
+    AGENT_TEST_ASSERT(ds4_config_project_root(cfg) == NULL);
+    AGENT_TEST_ASSERT(ds4_config_project_ds4_dir(cfg) == NULL);
+
+    char orig_cwd[PATH_MAX];
+    AGENT_TEST_ASSERT(getcwd(orig_cwd, sizeof(orig_cwd)) != NULL);
+    AGENT_TEST_ASSERT(chdir(fx) == 0);
+
+    agent_worker w = {0};
+    w.config = cfg;
+    char *result = agent_init_prompt_or_error(&w);
+    AGENT_TEST_ASSERT(result != NULL);
+    if (result) AGENT_TEST_ASSERT(!strcmp(result, AGENT_INIT_CANNED_PROMPT));
+    free(result);
+
+    AGENT_TEST_ASSERT(chdir(orig_cwd) == 0);
     ds4_config_free(cfg);
     rmdir(fx);
 }
@@ -8406,6 +8554,13 @@ static void test_agent_complete_candidates_first_word_all_and_prefix(void) {
     for (int i = 0; i < n; i++) free(out[i]);
     free(out);
 
+    out = NULL;
+    n = agent_complete_candidates("/i", NULL, &out);
+    AGENT_TEST_ASSERT(n == 1);
+    if (n == 1) AGENT_TEST_ASSERT(!strcmp(out[0], "/init"));
+    for (int i = 0; i < n; i++) free(out[i]);
+    free(out);
+
     ds4_commands_list_free(&g_agent_commands);
 }
 
@@ -8739,6 +8894,7 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_tool_skill_dispatch();
     test_agent_slash_command_known_file_commands();
     test_agent_slash_command_known_v2t3_commands();
+    test_agent_slash_command_known_init();
     test_agent_tool_hook_wrapper();
     test_agent_tool_call_subject_extraction();
     test_agent_permission_gate();
@@ -8748,6 +8904,9 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_render_memory_loaded_and_absent();
     test_agent_render_config_full();
     test_agent_render_config_no_project();
+    test_agent_init_prompt_or_error_already_initialized();
+    test_agent_init_prompt_or_error_no_ds4_yet();
+    test_agent_init_prompt_or_error_no_project_root();
     test_agent_render_mcp_empty();
     test_agent_render_mcp_listing();
     test_agent_render_model();
@@ -12752,6 +12911,54 @@ static char *agent_render_mcp(agent_worker *w) {
     return agent_input_buf_take(&buf);
 }
 
+/* /init's guard + prompt selection (AGENT_INIT_ALREADY_PREFIX/
+ * AGENT_INIT_CANNED_PROMPT are declared well above, right before the
+ * DS4_AGENT_TEST guard, for the reasons given there). The harness has no
+ * config by default -- no settings.json, no skills, no commands -- and
+ * everything it does load is read once at worker init (see
+ * agent_worker_init's ds4_config_load/ds4_commands_scan/ds4_skills_scan
+ * calls), never re-read mid-session. /init is deliberately the ONLY thing
+ * that ever writes into .ds4/: never triggered automatically, and its
+ * result only takes effect after a restart, exactly like any other config
+ * change (see the REPL dispatch arm's status line). That's also why this
+ * guard only ever inspects the effective .ds4 path rather than trying to
+ * merge into or react to whatever the model is about to write there.
+ *
+ * "Effective root" mirrors ds4_config's own project-vs-none split:
+ * ds4_config_project_ds4_dir(w->config) when a project root was
+ * discovered, else "<cwd>/.ds4" -- ds4_config itself returns NULL rather
+ * than synthesizing a path in that second case (see ds4_config.h), so this
+ * is the one place that needs to do the synthesis, using the process's
+ * actual cwd since that's what a NULL project root implies config was
+ * loaded relative to (see agent_worker_init's own comment on --chdir).
+ *
+ * Returns malloc'd text in both outcomes: the "already initialized: <path>"
+ * message (identified by its AGENT_INIT_ALREADY_PREFIX, since a single
+ * char* return can't also carry a second "which case was this" signal --
+ * the canned prompt can never start with that text) or the canned prompt,
+ * ready to submit as-is. A getcwd() failure (cwd removed/unreadable, sized
+ * out) is treated the same as "nothing there yet" rather than failing
+ * /init outright -- it just means the disk check below never finds
+ * anything to flag as already initialized. */
+static char *agent_init_prompt_or_error(agent_worker *w) {
+    const char *project_ds4 = w->config ? ds4_config_project_ds4_dir(w->config) : NULL;
+    char cwd_ds4[PATH_MAX];
+    const char *effective = project_ds4;
+    if (!effective) {
+        char cwd[PATH_MAX];
+        if (getcwd(cwd, sizeof(cwd))) {
+            snprintf(cwd_ds4, sizeof(cwd_ds4), "%s/.ds4", cwd);
+            effective = cwd_ds4;
+        }
+    }
+    if (effective && access(effective, F_OK) == 0) {
+        char *msg = xmalloc(strlen(AGENT_INIT_ALREADY_PREFIX) + strlen(effective) + 2);
+        sprintf(msg, "%s%s\n", AGENT_INIT_ALREADY_PREFIX, effective);
+        return msg;
+    }
+    return xstrdup(AGENT_INIT_CANNED_PROMPT);
+}
+
 static void runtime_help(void) {
     puts("Commands:");
     puts("  /help        Show this help.");
@@ -12765,6 +12972,7 @@ static void runtime_help(void) {
     puts("  /model       Show model path, context, think mode, sampling, backend.");
     puts("  /permissions Show effective permission policy (confirm/allow rules).");
     puts("  /hooks       Show configured PreToolUse/PostToolUse hooks.");
+    puts("  /init        Have the model scaffold this project's .ds4/ config.");
     puts("  /think       Show/switch think mode: nothink, think, or max.");
     puts("  /mcp [args]  Show MCP servers/tools; 'reconnect S' respawns a server.");
     puts("  /switch SHA  Load a saved session and show recent history.");
@@ -13788,6 +13996,41 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                     } else {
                         printf("/allow failed (out of memory)\n");
                     }
+                /* /init never touches worker state directly -- it only reads
+                 * w->config to find the effective .ds4 path and, if nothing
+                 * is there yet, submits the canned prompt as an ordinary user
+                 * turn. Placed after the busy-gate anyway (like /mcp
+                 * reconnect and /allow above) so the "already initialized"
+                 * short-circuit and the submission both see a guaranteed-idle
+                 * worker, rather than splitting one command's two outcomes
+                 * across the busy-gate boundary. */
+                } else if (!strcmp(cmd, "/init")) {
+                    char *result = agent_init_prompt_or_error(&worker);
+                    if (!strncmp(result, AGENT_INIT_ALREADY_PREFIX,
+                                 strlen(AGENT_INIT_ALREADY_PREFIX))) {
+                        fputs(result, stdout);
+                    } else {
+                        /* Config/skills/commands/MCP are all loaded once at
+                         * worker init (see agent_worker_init) and never
+                         * re-read mid-session, so whatever /init's turn
+                         * writes into .ds4/ can't take effect until the next
+                         * launch -- say so before submitting, since the
+                         * model's own "done" reply won't otherwise make that
+                         * clear. A live /reload that re-scans config without
+                         * a full restart is a plausible follow-up, but is out
+                         * of scope here. */
+                        printf("initializing harness config; restart dwarfstar "
+                               "(or /quit and relaunch) after it finishes to "
+                               "load the new files\n");
+                        linenoiseHistoryAdd(cmd);
+                        linenoiseHistorySave(hist);
+                        if (worker_submit(&worker, result)) {
+                            agent_echo_user_prompt(result);
+                        } else {
+                            restore_line = xstrdup(cmd);
+                        }
+                    }
+                    free(result);
                 } else if (cmd[0] == '/' &&
                            agent_split_first_word(cmd, cmdword, sizeof(cmdword), &cmdargs) &&
                            ds4_commands_known(&g_agent_commands, cmdword)) {

@@ -621,6 +621,11 @@ switch the thinking mode at runtime (think max applies from the next
 <pattern>` inspect and extend the permission gate for the session. Tab
 completes slash commands and their arguments, and the status line shows
 the think mode, skill count, MCP servers up, and the active session.
+`/init` is the one way project config comes into existence at all — it
+submits a canned prompt that has the model explore the repository and
+write a project-aware `AGENTS.md`, one starter skill, and non-active
+`settings.json.example`/`mcp.json.example` templates under `.ds4/`,
+taking effect on the next restart.
 
 ## Benchmarking
 
