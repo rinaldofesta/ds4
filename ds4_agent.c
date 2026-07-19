@@ -11511,7 +11511,7 @@ static void runtime_help(void) {
     puts("  /commands    List user-defined slash commands.");
     puts("  /memory      Show loaded project memory (AGENTS.md/DS4.md).");
     puts("  /config      Show effective harness configuration.");
-    puts("  /mcp [reconnect S]  Show MCP servers/tools; respawn a server.");
+    puts("  /mcp [args]  Show MCP servers/tools; 'reconnect S' respawns a server.");
     puts("  /switch SHA  Load a saved session and show recent history.");
     puts("  /del SHA     Delete a saved session.");
     puts("  /strip SHA   Strip KV payload; /switch rebuilds it by prefill.");

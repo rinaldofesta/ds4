@@ -233,6 +233,14 @@ int main(int argc, char **argv) {
 
         if (strstr(line, "\"method\":\"initialize\"")) {
             if (chatty) emit_chatty_noise();
+            /* "slow-init": sleeps well past any short handshake_timeout_ms a
+             * test configures before ever answering "initialize", so a
+             * reconnect (or the initial spawn) against this mode always
+             * times out the handshake -- a SIGTERM delivered by the caller
+             * in the meantime interrupts the sleep and ends this process
+             * immediately, regardless of how much longer it would have kept
+             * sleeping on its own. */
+            if (!strcmp(mode, "slow-init")) sleep(3);
             respond_initialize(id);
         } else if (strstr(line, "\"method\":\"notifications/initialized\"")) {
             /* no response */

@@ -405,6 +405,7 @@ static mcp_proc *mcp_proc_push(ds4_mcp_registry *reg, const char *name) {
 }
 
 static mcp_proc *mcp_find_proc(ds4_mcp_registry *reg, const char *name) {
+    if (!name) return NULL; /* every other public lookup here tolerates NULL */
     for (int i = 0; i < reg->proc_count; i++)
         if (!strcmp(reg->procs[i].name, name)) return &reg->procs[i];
     return NULL;
@@ -1160,7 +1161,10 @@ bool ds4_mcp_registry_reconnect(ds4_mcp_registry *reg, const char *server_name,
     }
     mcp_proc *p = mcp_find_proc(reg, server_name);
     if (!p) {
-        if (err && err_len) snprintf(err, err_len, "unknown MCP server: %s", server_name);
+        if (err && err_len) {
+            if (server_name) snprintf(err, err_len, "unknown MCP server: %s", server_name);
+            else snprintf(err, err_len, "unknown MCP server: (none given)");
+        }
         return false;
     }
 
@@ -1204,6 +1208,19 @@ bool ds4_mcp_registry_reconnect(ds4_mcp_registry *reg, const char *server_name,
     warnbuf[0] = '\0';
     if (!mcp_do_handshake(reg, p, server_name, warnbuf, sizeof(warnbuf))) {
         mcp_err_from_warn(err, err_len, "handshake failed", warnbuf);
+        /* mcp_do_handshake's MCP_RESP_TIMEOUT paths (unlike its MCP_RESP_DEAD
+         * ones, where mcp_read_line/mcp_await_response already called
+         * mcp_mark_dead) return false WITHOUT marking the proc dead -- a slow
+         * response doesn't necessarily mean a broken transport. But
+         * mcp_spawn_proc just set p->alive = true moments earlier, so
+         * without this, a slow-starting respawned server (plausible for an
+         * npx/uvx cold start against a short handshake_timeout_ms) would
+         * leave ds4_mcp_registry_reconnect reporting failure while /mcp's
+         * listing still showed it "[up pid N]". A reconnect that doesn't
+         * fully complete must not leave a half-initialized process behind,
+         * alive or not -- terminate and reap it explicitly rather than
+         * relying on a deeper layer having already done so. */
+        mcp_terminate_proc(p);
         return false;
     }
 
@@ -2051,6 +2068,13 @@ static void test_reconnect_unknown_name(void) {
             MCP_TEST_ASSERT(!ok);
             MCP_TEST_ASSERT(strstr(err, "unknown MCP server: nosuch") != NULL);
             MCP_TEST_ASSERT(ds4_mcp_registry_server_alive(reg, 0)); /* untouched */
+
+            /* NULL server_name must not crash (mcp_find_proc guards it, same
+             * as the four sibling accessors' NULL/OOB tolerance). */
+            char err3[256] = {0};
+            MCP_TEST_ASSERT(!ds4_mcp_registry_reconnect(reg, NULL, err3, sizeof(err3)));
+            MCP_TEST_ASSERT(err3[0] != '\0');
+            MCP_TEST_ASSERT(ds4_mcp_registry_server_alive(reg, 0)); /* still untouched */
         }
         ds4_mcp_registry_free(reg);
     }
@@ -2153,6 +2177,63 @@ static void test_reconnect_spawn_spec_retention(void) {
     mcp_test_teardown(fx, home, saved_home);
 }
 
+/* Reconnect against a server whose respawned process is slow to answer
+ * "initialize": mcp_do_handshake's MCP_RESP_TIMEOUT branch returns false
+ * WITHOUT marking the proc dead (unlike its MCP_RESP_DEAD siblings, where
+ * mcp_read_line/mcp_await_response already called mcp_mark_dead) -- a slow
+ * response doesn't necessarily mean a broken transport. Combined with
+ * mcp_spawn_proc having just set alive=true moments earlier, that used to
+ * leave a half-initialized, still-running process reported "alive" even
+ * though ds4_mcp_registry_reconnect itself reported failure. A short
+ * handshake_timeout_ms (via opts) keeps this well under the mock's
+ * "slow-init" sleep(3) -- and the whole test under 2s -- since SIGTERM
+ * interrupts a sleeping child immediately regardless of how much longer it
+ * would otherwise have slept. */
+static void test_reconnect_handshake_timeout_kills_process(void) {
+    char *fx, *home, *saved_home;
+    ds4_config *cfg = mcp_test_setup("slow-init", &fx, &home, &saved_home);
+    MCP_TEST_ASSERT(cfg != NULL);
+    if (cfg) {
+        ds4_mcp_opts opts = { 100, 0 }; /* 100ms handshake timeout; well under the mock's 3s sleep */
+        char warn[512] = {0};
+        ds4_mcp_registry *reg = ds4_mcp_registry_create(cfg, &opts, warn, sizeof(warn));
+        /* A server WAS configured, even though its own initial handshake
+         * also times out against "slow-init" -- that's registry_create's
+         * pre-existing, out-of-scope-for-this-fix behavior (it leaves a
+         * timed-out-but-still-running proc for teardown to reap later); the
+         * process is still genuinely running at this point. */
+        MCP_TEST_ASSERT(reg != NULL);
+        if (reg) {
+            pid_t old_pid = ds4_mcp_test_proc_pid(reg, 0);
+            MCP_TEST_ASSERT(old_pid > 0);
+
+            char err[256] = {0};
+            bool ok = ds4_mcp_registry_reconnect(reg, "mock", err, sizeof(err));
+            MCP_TEST_ASSERT(!ok);
+            MCP_TEST_ASSERT(err[0] != '\0');
+            MCP_TEST_ASSERT(ds4_mcp_registry_server_alive(reg, 0) == false);
+
+            /* mcp_terminate_proc only ever returns after actually waiting on
+             * the pid (either the poll loop's WNOHANG success or the forced
+             * SIGKILL + blocking waitpid), so pid == -1 here is direct
+             * evidence the respawned process was reaped, not just marked
+             * dead in bookkeeping -- no orphan left behind. */
+            MCP_TEST_ASSERT(ds4_mcp_test_proc_pid(reg, 0) == -1);
+
+            /* The original (pre-reconnect) process, terminated by
+             * reconnect's own "if alive, terminate first" step, is confirmed
+             * gone too. */
+            if (old_pid > 0) {
+                int r = kill(old_pid, 0);
+                MCP_TEST_ASSERT(r == -1 && errno == ESRCH);
+            }
+        }
+        ds4_mcp_registry_free(reg);
+    }
+    ds4_config_free(cfg);
+    mcp_test_teardown(fx, home, saved_home);
+}
+
 int ds4_mcp_unit_tests_run(void) {
     test_normal();
     test_args_to_json();
@@ -2173,6 +2254,7 @@ int ds4_mcp_unit_tests_run(void) {
     test_reconnect_unknown_name();
     test_reconnect_while_alive();
     test_reconnect_spawn_spec_retention();
+    test_reconnect_handshake_timeout_kills_process();
     return mcp_test_failures;
 }
 #endif
