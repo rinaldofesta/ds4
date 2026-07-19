@@ -14019,7 +14019,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                          * clear. A live /reload that re-scans config without
                          * a full restart is a plausible follow-up, but is out
                          * of scope here. */
-                        printf("initializing harness config; restart dwarfstar "
+                        printf("initializing harness config; restart ds4-agent "
                                "(or /quit and relaunch) after it finishes to "
                                "load the new files\n");
                         linenoiseHistoryAdd(cmd);
