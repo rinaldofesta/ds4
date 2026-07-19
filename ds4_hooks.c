@@ -99,6 +99,7 @@ typedef struct {
     char *matcher;   /* fnmatch glob, never NULL, defaults to "*" */
     char *command;   /* /bin/sh -c argument */
     int timeout_ms;  /* effective, always > 0 */
+    char *origin;    /* NULL = settings.json; else the owning plugin's name */
 } hook_entry;
 
 typedef struct { hook_entry *v; int len, cap; } hook_entry_list;
@@ -120,6 +121,7 @@ static void hook_entry_list_free(hook_entry_list *list) {
     for (int i = 0; i < list->len; i++) {
         free(list->v[i].matcher);
         free(list->v[i].command);
+        free(list->v[i].origin);
     }
     free(list->v);
     memset(list, 0, sizeof(*list));
@@ -185,6 +187,7 @@ static void hk_parse_hooks_obj(const ds4_json_value *hooks_v, ds4_hooks *tmp,
             he.matcher = hk_strdup((matcher && matcher[0]) ? matcher : "*");
             he.command = hk_resolve_command(command, plugin_dir);
             he.timeout_ms = (timeout_num > 0) ? (int)timeout_num : DS4_HOOKS_DEFAULT_TIMEOUT_MS;
+            he.origin = plugin_name ? hk_strdup(plugin_name) : NULL;
             hook_entry_push(&tmp->events[ev], he);
         }
     }
@@ -310,6 +313,30 @@ void ds4_hooks_free(ds4_hooks *h) {
 int ds4_hooks_count(const ds4_hooks *h, ds4_hook_event event) {
     if (!h) return 0;
     return h->events[event].len;
+}
+
+int ds4_hooks_entry_count(const ds4_hooks *h, ds4_hook_event event) {
+    return ds4_hooks_count(h, event);
+}
+
+const char *ds4_hooks_entry_matcher(const ds4_hooks *h, ds4_hook_event event, int i) {
+    if (!h || i < 0 || i >= h->events[event].len) return NULL;
+    return h->events[event].v[i].matcher;
+}
+
+const char *ds4_hooks_entry_command(const ds4_hooks *h, ds4_hook_event event, int i) {
+    if (!h || i < 0 || i >= h->events[event].len) return NULL;
+    return h->events[event].v[i].command;
+}
+
+const char *ds4_hooks_entry_origin(const ds4_hooks *h, ds4_hook_event event, int i) {
+    if (!h || i < 0 || i >= h->events[event].len) return NULL;
+    return h->events[event].v[i].origin;
+}
+
+int ds4_hooks_entry_timeout_ms(const ds4_hooks *h, ds4_hook_event event, int i) {
+    if (!h || i < 0 || i >= h->events[event].len) return 0;
+    return h->events[event].v[i].timeout_ms;
 }
 
 /* ---- subprocess mechanics ---- */
@@ -1146,6 +1173,12 @@ static void test_plugin_hooks_run_after_settings(void) {
         HOOKS_TEST_ASSERT(h != NULL);
         if (h) {
             HOOKS_TEST_ASSERT(ds4_hooks_count(h, DS4_HOOK_PRE_TOOL) == 2);
+            /* Origin tracking (see ds4_hooks.h/hook_entry): the settings.json
+             * entry carries no plugin name (NULL); the plugin-loaded sibling
+             * carries the plugin's own name, regardless of registration order. */
+            HOOKS_TEST_ASSERT(ds4_hooks_entry_origin(h, DS4_HOOK_PRE_TOOL, 0) == NULL);
+            const char *origin1 = ds4_hooks_entry_origin(h, DS4_HOOK_PRE_TOOL, 1);
+            HOOKS_TEST_ASSERT(origin1 != NULL && !strcmp(origin1, "myplugin"));
             ds4_hook_result r = ds4_hooks_run(h, DS4_HOOK_PRE_TOOL, "bash", "{}");
             HOOKS_TEST_ASSERT(!r.blocked);
             ds4_hook_result_free(&r);
@@ -1338,6 +1371,51 @@ static void test_plugin_settings_json_ignored(void) {
     free(fx);
 }
 
+/* Entry accessors: h==NULL degrades exactly like ds4_hooks_count(NULL, ...);
+ * a loaded settings-only handle round-trips matcher/command/timeout_ms and
+ * reports origin==NULL (settings-derived); negative and >=count indices, and
+ * the always-empty POST_TOOL event, are all OOB-tolerant (NULL/0), never a
+ * crash. */
+static void test_entry_accessors_null_and_oob(void) {
+    HOOKS_TEST_ASSERT(ds4_hooks_entry_count(NULL, DS4_HOOK_PRE_TOOL) == 0);
+    HOOKS_TEST_ASSERT(ds4_hooks_entry_matcher(NULL, DS4_HOOK_PRE_TOOL, 0) == NULL);
+    HOOKS_TEST_ASSERT(ds4_hooks_entry_command(NULL, DS4_HOOK_PRE_TOOL, 0) == NULL);
+    HOOKS_TEST_ASSERT(ds4_hooks_entry_origin(NULL, DS4_HOOK_PRE_TOOL, 0) == NULL);
+    HOOKS_TEST_ASSERT(ds4_hooks_entry_timeout_ms(NULL, DS4_HOOK_PRE_TOOL, 0) == 0);
+
+    char *fx, *home, *saved_home;
+    ds4_config *cfg = hkt_setup(
+        "{\"hooks\":{\"PreToolUse\":[{\"matcher\":\"bash\",\"command\":\"true\",\"timeout_ms\":5000}]}}",
+        NULL, &fx, &home, &saved_home);
+    HOOKS_TEST_ASSERT(cfg != NULL);
+    if (cfg) {
+        char warn[256] = {0};
+        ds4_hooks *h = ds4_hooks_load(cfg, warn, sizeof(warn));
+        HOOKS_TEST_ASSERT(h != NULL);
+        if (h) {
+            HOOKS_TEST_ASSERT(ds4_hooks_entry_count(h, DS4_HOOK_PRE_TOOL) == 1);
+            const char *matcher = ds4_hooks_entry_matcher(h, DS4_HOOK_PRE_TOOL, 0);
+            const char *command = ds4_hooks_entry_command(h, DS4_HOOK_PRE_TOOL, 0);
+            HOOKS_TEST_ASSERT(matcher != NULL && !strcmp(matcher, "bash"));
+            HOOKS_TEST_ASSERT(command != NULL && !strcmp(command, "true"));
+            HOOKS_TEST_ASSERT(ds4_hooks_entry_origin(h, DS4_HOOK_PRE_TOOL, 0) == NULL);
+            HOOKS_TEST_ASSERT(ds4_hooks_entry_timeout_ms(h, DS4_HOOK_PRE_TOOL, 0) == 5000);
+
+            HOOKS_TEST_ASSERT(ds4_hooks_entry_matcher(h, DS4_HOOK_PRE_TOOL, -1) == NULL);
+            HOOKS_TEST_ASSERT(ds4_hooks_entry_matcher(h, DS4_HOOK_PRE_TOOL, 1) == NULL);
+            HOOKS_TEST_ASSERT(ds4_hooks_entry_command(h, DS4_HOOK_PRE_TOOL, 99) == NULL);
+            HOOKS_TEST_ASSERT(ds4_hooks_entry_timeout_ms(h, DS4_HOOK_PRE_TOOL, 99) == 0);
+            HOOKS_TEST_ASSERT(ds4_hooks_entry_count(h, DS4_HOOK_POST_TOOL) == 0);
+            HOOKS_TEST_ASSERT(ds4_hooks_entry_matcher(h, DS4_HOOK_POST_TOOL, 0) == NULL);
+            HOOKS_TEST_ASSERT(ds4_hooks_entry_origin(h, DS4_HOOK_POST_TOOL, 0) == NULL);
+
+            ds4_hooks_free(h);
+        }
+    }
+    ds4_config_free(cfg);
+    hkt_teardown(fx, home, saved_home);
+}
+
 int ds4_hooks_unit_tests_run(void) {
     char *allow = hkt_resolve_fixture("tests/fixtures/hook_allow.sh");
     char *block = hkt_resolve_fixture("tests/fixtures/hook_block.sh");
@@ -1363,6 +1441,7 @@ int ds4_hooks_unit_tests_run(void) {
     test_plugin_hooks_relative_command_resolves_to_plugin_dir();
     test_plugin_hooks_malformed_warns_siblings_fine();
     test_plugin_settings_json_ignored();
+    test_entry_accessors_null_and_oob();
 
     free(allow); free(block); free(broken); free(stdin_fx); free(slow);
     return hooks_test_failures;

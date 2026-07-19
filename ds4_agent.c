@@ -505,13 +505,18 @@ static bool agent_slash_command_known(const char *cmd) {
         !strcmp(cmd, "/commands") ||
         !strcmp(cmd, "/memory") ||
         !strcmp(cmd, "/config") ||
+        !strcmp(cmd, "/model") ||
+        !strcmp(cmd, "/permissions") ||
+        !strcmp(cmd, "/hooks") ||
         agent_slash_command_with_args(cmd, "/power") ||
         agent_slash_command_with_args(cmd, "/switch") ||
         agent_slash_command_with_args(cmd, "/del") ||
         agent_slash_command_with_args(cmd, "/strip") ||
         agent_slash_command_with_args(cmd, "/history") ||
         agent_slash_command_with_args(cmd, "/skills") ||
-        agent_slash_command_with_args(cmd, "/mcp"))
+        agent_slash_command_with_args(cmd, "/mcp") ||
+        agent_slash_command_with_args(cmd, "/think") ||
+        agent_slash_command_with_args(cmd, "/allow"))
         return true;
 
     /* cmd is the whole trimmed input line here, not just the command word --
@@ -788,6 +793,51 @@ static void log_context_memory(ds4_backend backend,
 
 static ds4_think_mode effective_think_mode(const agent_config *cfg) {
     return ds4_think_mode_for_context(cfg->gen.think_mode, cfg->gen.ctx_size);
+}
+
+/* Pure switch logic for "/think [nothink|think|max]", factored out of the
+ * REPL dispatch so it's testable without a live worker. arg must already be
+ * one of "nothink"/"think"/"max"; anything else is a usage error (msg set,
+ * false returned, cfg untouched). On a recognized arg, mutates
+ * cfg->gen.think_mode and writes the line to print into msg.
+ *
+ * DS4_THINK_MAX is special, verified against agent_worker_build_system_tokens
+ * and worker_run_turn: the max-effort prefix (ds4_chat_append_max_effort_prefix)
+ * is only ever added when the system tokens are (re)built from scratch --
+ * agent_worker_reset_to_sysprompt (a fresh /new) and agent_worker_compact
+ * (context compaction, automatic or via /compact) both call
+ * agent_worker_build_system_tokens and both splice its output in as the new
+ * transcript prefix. It is NOT re-evaluated per turn: worker_run_turn reads
+ * effective_think_mode(cfg) fresh at the top of every turn, but only feeds it
+ * into that turn's assistant prefix (ds4_chat_append_assistant_prefix) and
+ * format_thinking/in_think flags -- nothing about entering or leaving MAX
+ * gets baked into the live transcript there. So switching into or out of MAX
+ * cannot change the current live session until the prefix is rebuilt by a
+ * /new or a compaction; nothink<->think toggles apply on the very next turn,
+ * since neither one touches that prefix. */
+static bool agent_think_mode_apply(agent_config *cfg, const char *arg,
+                                   char *msg, size_t msg_len) {
+    ds4_think_mode target;
+    if (!strcmp(arg, "nothink")) target = DS4_THINK_NONE;
+    else if (!strcmp(arg, "think")) target = DS4_THINK_HIGH;
+    else if (!strcmp(arg, "max")) target = DS4_THINK_MAX;
+    else {
+        snprintf(msg, msg_len, "usage: /think [nothink|think|max]\n");
+        return false;
+    }
+
+    ds4_think_mode prev = cfg->gen.think_mode;
+    cfg->gen.think_mode = target;
+
+    if (prev == DS4_THINK_MAX || target == DS4_THINK_MAX) {
+        snprintf(msg, msg_len,
+                 "think mode set to %s; think max takes effect on the next "
+                 "/new or /compact (the session prefix must be rebuilt)\n",
+                 ds4_think_mode_name(target));
+    } else {
+        snprintf(msg, msg_len, "think mode set to %s\n", ds4_think_mode_name(target));
+    }
+    return true;
 }
 
 /* ============================================================================
@@ -6634,6 +6684,12 @@ static char *agent_render_commands(agent_worker *w, const char *arg);
 static char *agent_render_memory(agent_worker *w, const char *arg);
 static char *agent_render_config(agent_worker *w, const char *arg);
 static char *agent_render_mcp(agent_worker *w);
+static char *agent_render_model(agent_worker *w, const char *arg);
+static char *agent_render_permissions(agent_worker *w, const char *arg);
+static char *agent_render_hooks(agent_worker *w, const char *arg);
+/* agent_think_mode_apply is NOT forward declared here: it's pure config
+ * logic defined right next to effective_think_mode, well above this test
+ * block, so it's already visible by this point. */
 
 static void test_agent_tool_skill_dispatch(void) {
     char tmpl[] = "/tmp/ds4_agent_skill_dispatch_test.XXXXXX";
@@ -6711,6 +6767,22 @@ static void test_agent_slash_command_known_file_commands(void) {
 
     ds4_commands_list_free(&g_agent_commands);
     AGENT_TEST_ASSERT(!agent_slash_command_known("/mycmd"));
+}
+
+/* /model, /permissions, /hooks are bare-only (no argument form, same as
+ * /commands/memory/config); /think and /allow take args via
+ * agent_slash_command_with_args, so a bare form and a form with args must
+ * both be known, while a mere prefix collision ("/thinkfoo") must not. */
+static void test_agent_slash_command_known_v2t3_commands(void) {
+    AGENT_TEST_ASSERT(agent_slash_command_known("/model"));
+    AGENT_TEST_ASSERT(agent_slash_command_known("/permissions"));
+    AGENT_TEST_ASSERT(agent_slash_command_known("/hooks"));
+    AGENT_TEST_ASSERT(agent_slash_command_known("/think"));
+    AGENT_TEST_ASSERT(agent_slash_command_known("/think max"));
+    AGENT_TEST_ASSERT(agent_slash_command_known("/allow"));
+    AGENT_TEST_ASSERT(agent_slash_command_known("/allow bash make *"));
+    AGENT_TEST_ASSERT(!agent_slash_command_known("/thinkfoo"));
+    AGENT_TEST_ASSERT(!agent_slash_command_known("/allowlist"));
 }
 
 /* Drives the agent_execute_tool_call dispatch wrapper end to end: a real
@@ -7461,6 +7533,356 @@ static void test_agent_render_mcp_listing(void) {
     rmdir(fx);
 }
 
+/* agent_render_model: a fixture agent_config with a known model path, ctx
+ * size, sampling params, seed, and backend must show up verbatim; think mode
+ * routes through effective_think_mode, so a configured DS4_THINK_MAX with a
+ * context below DS4_THINK_MAX_MIN_CONTEXT must render as the downgraded
+ * "high" plus a note, not the raw configured "max". */
+static void test_agent_render_model(void) {
+    agent_config cfg = {0};
+    cfg.engine.model_path = "ds4flash.gguf";
+    cfg.engine.backend = DS4_BACKEND_CPU;
+    cfg.gen.ctx_size = 100000;
+    cfg.gen.temperature = 0.7f;
+    cfg.gen.top_p = 0.9f;
+    cfg.gen.min_p = 0.05f;
+    cfg.gen.seed = 42;
+    cfg.gen.think_mode = DS4_THINK_HIGH;
+
+    agent_worker w = {0};
+    w.cfg = &cfg;
+
+    char *rendered = agent_render_model(&w, "");
+    AGENT_TEST_ASSERT(rendered != NULL);
+    if (rendered) {
+        AGENT_TEST_ASSERT(strstr(rendered, "Model: ds4flash.gguf") != NULL);
+        AGENT_TEST_ASSERT(strstr(rendered, "Context: 100000 tokens") != NULL);
+        AGENT_TEST_ASSERT(strstr(rendered, "Think mode: high") != NULL);
+        AGENT_TEST_ASSERT(strstr(rendered, "seed=42") != NULL);
+        AGENT_TEST_ASSERT(strstr(rendered, "Backend: cpu") != NULL);
+    }
+    free(rendered);
+
+    cfg.gen.think_mode = DS4_THINK_MAX;
+    cfg.gen.ctx_size = 4096; /* well below DS4_THINK_MAX_MIN_CONTEXT */
+    char *rendered2 = agent_render_model(&w, "");
+    AGENT_TEST_ASSERT(rendered2 != NULL);
+    if (rendered2)
+        AGENT_TEST_ASSERT(strstr(rendered2, "Think mode: high (configured max") != NULL);
+    free(rendered2);
+}
+
+/* agent_render_permissions: project-scope settings.json permissions gets its
+ * allow rule tagged [project] (see perm_allow_rule_in_project_scope); a rule
+ * added afterward via ds4_permissions_add_allow is tagged [session] (index
+ * >= ds4_permissions_settings_allow_len). A second fixture with a
+ * user-only settings.json (project settings.json has no "permissions" key at
+ * all) gets its rule tagged [user] instead -- "permissions" is a whole-key
+ * wholesale-replace merge (see ds4_permissions.h), so a single
+ * ds4_permissions_load can never mix [project] and [user] tags among its
+ * settings-derived rules; hence two fixtures rather than one render call.
+ * Finally, no permissions loaded at all renders the configured hint. */
+static void test_agent_render_permissions(void) {
+    {
+        char tmpl[] = "/tmp/ds4_agent_render_perms_proj_test.XXXXXX";
+        char *fx = mkdtemp(tmpl);
+        AGENT_TEST_ASSERT(fx != NULL);
+        if (fx) {
+            char ds4dir[PATH_MAX], settings_path[PATH_MAX];
+            snprintf(ds4dir, sizeof(ds4dir), "%s/.ds4", fx);
+            AGENT_TEST_ASSERT(agent_mkdir_p(ds4dir));
+            snprintf(settings_path, sizeof(settings_path), "%s/settings.json", ds4dir);
+            FILE *fp = fopen(settings_path, "wb");
+            AGENT_TEST_ASSERT(fp != NULL);
+            if (fp) {
+                fputs("{\"permissions\":{\"confirm\":[\"bash\"],\"allow\":[\"bash:git status*\"]}}", fp);
+                fclose(fp);
+            }
+
+            const char *home_save_val = getenv("HOME");
+            char *home_save = home_save_val ? xstrdup(home_save_val) : NULL;
+            setenv("HOME", fx, 1);
+
+            char warn[256] = {0};
+            ds4_config *cfg = ds4_config_load(fx, warn, sizeof(warn));
+            AGENT_TEST_ASSERT(cfg != NULL);
+            ds4_permissions *perms = cfg ? ds4_permissions_load(cfg, warn, sizeof(warn)) : NULL;
+            AGENT_TEST_ASSERT(perms != NULL);
+
+            if (home_save) { setenv("HOME", home_save, 1); free(home_save); }
+            else unsetenv("HOME");
+
+            agent_config acfg = {0};
+            agent_worker w = {0};
+            w.cfg = &acfg;
+            w.config = cfg;
+            w.perms = perms;
+
+            if (perms) AGENT_TEST_ASSERT(ds4_permissions_add_allow(perms, "write", "*.md"));
+
+            char *rendered = agent_render_permissions(&w, "");
+            AGENT_TEST_ASSERT(rendered != NULL);
+            if (rendered) {
+                AGENT_TEST_ASSERT(strstr(rendered, "Auto-approve: off") != NULL);
+                AGENT_TEST_ASSERT(strstr(rendered, "  bash\n") != NULL);
+                AGENT_TEST_ASSERT(strstr(rendered, "bash: git status* [project]") != NULL);
+                AGENT_TEST_ASSERT(strstr(rendered, "write: *.md [session]") != NULL);
+            }
+            free(rendered);
+
+            ds4_permissions_free(perms);
+            ds4_config_free(cfg);
+            unlink(settings_path);
+            rmdir(ds4dir);
+            rmdir(fx);
+        }
+    }
+
+    {
+        char tmpl[] = "/tmp/ds4_agent_render_perms_user_test.XXXXXX";
+        char *fx = mkdtemp(tmpl);
+        AGENT_TEST_ASSERT(fx != NULL);
+        if (fx) {
+            char proj[PATH_MAX], home[PATH_MAX];
+            snprintf(proj, sizeof(proj), "%s/proj", fx);
+            snprintf(home, sizeof(home), "%s/home", fx);
+            AGENT_TEST_ASSERT(agent_mkdir_p(proj));
+            char home_ds4[PATH_MAX], home_settings[PATH_MAX];
+            snprintf(home_ds4, sizeof(home_ds4), "%s/.ds4", home);
+            AGENT_TEST_ASSERT(agent_mkdir_p(home_ds4));
+            snprintf(home_settings, sizeof(home_settings), "%s/settings.json", home_ds4);
+            FILE *fp = fopen(home_settings, "wb");
+            AGENT_TEST_ASSERT(fp != NULL);
+            if (fp) {
+                fputs("{\"permissions\":{\"confirm\":[\"bash\"],\"allow\":[\"bash:make *\"]}}", fp);
+                fclose(fp);
+            }
+
+            const char *home_save_val = getenv("HOME");
+            char *home_save = home_save_val ? xstrdup(home_save_val) : NULL;
+            setenv("HOME", home, 1);
+
+            char warn[256] = {0};
+            ds4_config *cfg = ds4_config_load(proj, warn, sizeof(warn));
+            AGENT_TEST_ASSERT(cfg != NULL);
+            ds4_permissions *perms = cfg ? ds4_permissions_load(cfg, warn, sizeof(warn)) : NULL;
+            AGENT_TEST_ASSERT(perms != NULL);
+
+            if (home_save) { setenv("HOME", home_save, 1); free(home_save); }
+            else unsetenv("HOME");
+
+            agent_config acfg = {0};
+            agent_worker w = {0};
+            w.cfg = &acfg;
+            w.config = cfg;
+            w.perms = perms;
+
+            char *rendered = agent_render_permissions(&w, "");
+            AGENT_TEST_ASSERT(rendered != NULL);
+            if (rendered) AGENT_TEST_ASSERT(strstr(rendered, "bash: make * [user]") != NULL);
+            free(rendered);
+
+            ds4_permissions_free(perms);
+            ds4_config_free(cfg);
+            unlink(home_settings);
+            rmdir(home_ds4);
+            rmdir(proj);
+            rmdir(home);
+            rmdir(fx);
+        }
+    }
+
+    {
+        agent_worker w = {0};
+        char *hint = agent_render_permissions(&w, "");
+        AGENT_TEST_ASSERT(hint != NULL);
+        if (hint) AGENT_TEST_ASSERT(strstr(hint, "No permissions configured") != NULL);
+        free(hint);
+    }
+}
+
+/* agent_render_hooks: a settings.json hook plus a plugin hook must render
+ * both origin tags ("[settings]" and "[plugin <name>]") with matcher/command/
+ * timeout intact; no hooks configured renders the hint. */
+static void test_agent_render_hooks(void) {
+    char tmpl[] = "/tmp/ds4_agent_render_hooks_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    AGENT_TEST_ASSERT(fx != NULL);
+    if (fx) {
+        /* proj and home MUST be distinct dirs here (unlike some other
+         * fixtures in this file that reuse fx for both): with a plugin root
+         * in play, HOME == the project root would make user_ds4_dir and
+         * project_ds4_dir the same path, so ds4_config would enumerate the
+         * plugin twice (once as a project plugin, once as a "user" plugin
+         * pointing at the identical directory) and ds4_hooks_load would load
+         * its hooks.json twice. */
+        char proj[PATH_MAX], home[PATH_MAX];
+        snprintf(proj, sizeof(proj), "%s/proj", fx);
+        snprintf(home, sizeof(home), "%s/home", fx);
+        AGENT_TEST_ASSERT(agent_mkdir_p(home));
+
+        char ds4dir[PATH_MAX], settings_path[PATH_MAX];
+        snprintf(ds4dir, sizeof(ds4dir), "%s/.ds4", proj);
+        AGENT_TEST_ASSERT(agent_mkdir_p(ds4dir));
+        snprintf(settings_path, sizeof(settings_path), "%s/settings.json", ds4dir);
+        FILE *fp = fopen(settings_path, "wb");
+        AGENT_TEST_ASSERT(fp != NULL);
+        if (fp) {
+            fputs("{\"hooks\":{\"PreToolUse\":"
+                  "[{\"matcher\":\"bash\",\"command\":\"true\",\"timeout_ms\":5000}]}}", fp);
+            fclose(fp);
+        }
+
+        char plugin_dir[PATH_MAX];
+        snprintf(plugin_dir, sizeof(plugin_dir), "%s/plugins/myplug", ds4dir);
+        AGENT_TEST_ASSERT(agent_mkdir_p(plugin_dir));
+        char plugin_hooks_path[PATH_MAX];
+        snprintf(plugin_hooks_path, sizeof(plugin_hooks_path), "%s/hooks.json", plugin_dir);
+        fp = fopen(plugin_hooks_path, "wb");
+        AGENT_TEST_ASSERT(fp != NULL);
+        if (fp) {
+            fputs("{\"hooks\":{\"PostToolUse\":[{\"matcher\":\"*\",\"command\":\"echo hi\"}]}}", fp);
+            fclose(fp);
+        }
+
+        const char *home_save_val = getenv("HOME");
+        char *home_save = home_save_val ? xstrdup(home_save_val) : NULL;
+        setenv("HOME", home, 1);
+
+        char warn[256] = {0};
+        ds4_config *cfg = ds4_config_load(proj, warn, sizeof(warn));
+        AGENT_TEST_ASSERT(cfg != NULL);
+        ds4_hooks *hooks = cfg ? ds4_hooks_load(cfg, warn, sizeof(warn)) : NULL;
+        AGENT_TEST_ASSERT(hooks != NULL);
+
+        if (home_save) { setenv("HOME", home_save, 1); free(home_save); }
+        else unsetenv("HOME");
+
+        agent_worker w = {0};
+        w.hooks = hooks;
+
+        char *rendered = agent_render_hooks(&w, "");
+        AGENT_TEST_ASSERT(rendered != NULL);
+        if (rendered) {
+            AGENT_TEST_ASSERT(strstr(rendered, "PreToolUse (1):") != NULL);
+            AGENT_TEST_ASSERT(strstr(rendered, "bash \xe2\x86\x92 true (timeout 5000ms) [settings]") != NULL);
+            AGENT_TEST_ASSERT(strstr(rendered, "PostToolUse (1):") != NULL);
+            AGENT_TEST_ASSERT(strstr(rendered, "* \xe2\x86\x92 echo hi (timeout 10000ms) [plugin myplug]") != NULL);
+        }
+        free(rendered);
+
+        ds4_hooks_free(hooks);
+        ds4_config_free(cfg);
+        unlink(settings_path);
+        unlink(plugin_hooks_path);
+        rmdir(plugin_dir);
+        char plugins_dir[PATH_MAX];
+        snprintf(plugins_dir, sizeof(plugins_dir), "%s/plugins", ds4dir);
+        rmdir(plugins_dir);
+        rmdir(ds4dir);
+        rmdir(proj);
+        rmdir(home);
+        rmdir(fx);
+    }
+
+    agent_worker w_none = {0};
+    char *hint = agent_render_hooks(&w_none, "");
+    AGENT_TEST_ASSERT(hint != NULL);
+    if (hint) AGENT_TEST_ASSERT(strstr(hint, "No hooks configured") != NULL);
+    free(hint);
+}
+
+/* agent_think_mode_apply: nothink<->think switches take effect immediately
+ * (no deferral wording); anything touching DS4_THINK_MAX (entering or
+ * leaving it) prints the "/new or /compact" deferral note, per
+ * agent_worker_build_system_tokens/worker_run_turn (see the comment on
+ * agent_think_mode_apply itself). Unknown args are a no-op usage error. */
+static void test_agent_think_mode_apply(void) {
+    agent_config cfg = {0};
+    cfg.gen.think_mode = DS4_THINK_NONE;
+    char msg[256];
+
+    AGENT_TEST_ASSERT(agent_think_mode_apply(&cfg, "think", msg, sizeof(msg)));
+    AGENT_TEST_ASSERT(cfg.gen.think_mode == DS4_THINK_HIGH);
+    AGENT_TEST_ASSERT(strstr(msg, "think mode set to high") != NULL);
+    AGENT_TEST_ASSERT(strstr(msg, "/new") == NULL);
+
+    AGENT_TEST_ASSERT(agent_think_mode_apply(&cfg, "nothink", msg, sizeof(msg)));
+    AGENT_TEST_ASSERT(cfg.gen.think_mode == DS4_THINK_NONE);
+    AGENT_TEST_ASSERT(strstr(msg, "think mode set to none") != NULL);
+    AGENT_TEST_ASSERT(strstr(msg, "/new") == NULL);
+
+    AGENT_TEST_ASSERT(agent_think_mode_apply(&cfg, "max", msg, sizeof(msg)));
+    AGENT_TEST_ASSERT(cfg.gen.think_mode == DS4_THINK_MAX);
+    AGENT_TEST_ASSERT(strstr(msg, "think max takes effect on the next /new or /compact") != NULL);
+
+    /* Leaving max needs the same deferral: the OLD max-effort prefix is
+     * still live in the transcript until the next rebuild. */
+    AGENT_TEST_ASSERT(agent_think_mode_apply(&cfg, "think", msg, sizeof(msg)));
+    AGENT_TEST_ASSERT(cfg.gen.think_mode == DS4_THINK_HIGH);
+    AGENT_TEST_ASSERT(strstr(msg, "think max takes effect on the next /new or /compact") != NULL);
+
+    AGENT_TEST_ASSERT(!agent_think_mode_apply(&cfg, "bogus", msg, sizeof(msg)));
+    AGENT_TEST_ASSERT(cfg.gen.think_mode == DS4_THINK_HIGH); /* untouched on a usage error */
+    AGENT_TEST_ASSERT(strstr(msg, "usage: /think") != NULL);
+}
+
+/* /allow's REPL glue (run_agent's dispatch arm) is two calls into
+ * ds4_permissions -- add_allow then, on the next gated tool call, check --
+ * already covered at the module level (ds4_permissions_test); this exercises
+ * them the same way run_agent does, through a worker's w->perms, to prove the
+ * ASK->ALLOW transition holds end to end. w->perms==NULL (no permissions
+ * configured) is the REPL's own no-op branch -- there is no separate helper
+ * to call, so it's asserted directly here that a bare zeroed worker has no
+ * perms object for /allow to mutate. */
+static void test_agent_allow_glue(void) {
+    agent_worker w_none = {0};
+    AGENT_TEST_ASSERT(w_none.perms == NULL);
+
+    char tmpl[] = "/tmp/ds4_agent_allow_glue_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    AGENT_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    char ds4dir[PATH_MAX], settings_path[PATH_MAX];
+    snprintf(ds4dir, sizeof(ds4dir), "%s/.ds4", fx);
+    AGENT_TEST_ASSERT(agent_mkdir_p(ds4dir));
+    snprintf(settings_path, sizeof(settings_path), "%s/settings.json", ds4dir);
+    FILE *fp = fopen(settings_path, "wb");
+    AGENT_TEST_ASSERT(fp != NULL);
+    if (fp) {
+        fputs("{\"permissions\":{\"confirm\":[\"bash\"]}}", fp);
+        fclose(fp);
+    }
+
+    const char *home_save_val = getenv("HOME");
+    char *home_save = home_save_val ? xstrdup(home_save_val) : NULL;
+    setenv("HOME", fx, 1);
+
+    char warn[256] = {0};
+    ds4_config *cfg = ds4_config_load(fx, warn, sizeof(warn));
+    AGENT_TEST_ASSERT(cfg != NULL);
+    ds4_permissions *perms = cfg ? ds4_permissions_load(cfg, warn, sizeof(warn)) : NULL;
+    AGENT_TEST_ASSERT(perms != NULL);
+
+    if (home_save) { setenv("HOME", home_save, 1); free(home_save); }
+    else unsetenv("HOME");
+
+    agent_worker w = {0};
+    w.perms = perms;
+    if (w.perms) {
+        AGENT_TEST_ASSERT(ds4_permissions_check(w.perms, "bash", "make test") == DS4_PERM_ASK);
+        AGENT_TEST_ASSERT(ds4_permissions_add_allow(w.perms, "bash", "make *"));
+        AGENT_TEST_ASSERT(ds4_permissions_check(w.perms, "bash", "make test") == DS4_PERM_ALLOW);
+    }
+
+    ds4_permissions_free(perms);
+    ds4_config_free(cfg);
+    unlink(settings_path);
+    rmdir(ds4dir);
+    rmdir(fx);
+}
+
 /* agent_flags_conflict() is a pure function of agent_config -- no worker, no
  * engine -- so the --continue/--resume mutual exclusion check is testable
  * directly: both set is a conflict, either alone or neither is not. */
@@ -7759,6 +8181,7 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_edit_upto_requires_tail_after_newline_strip();
     test_agent_tool_skill_dispatch();
     test_agent_slash_command_known_file_commands();
+    test_agent_slash_command_known_v2t3_commands();
     test_agent_tool_hook_wrapper();
     test_agent_tool_call_subject_extraction();
     test_agent_permission_gate();
@@ -7770,6 +8193,11 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_render_config_no_project();
     test_agent_render_mcp_empty();
     test_agent_render_mcp_listing();
+    test_agent_render_model();
+    test_agent_render_permissions();
+    test_agent_render_hooks();
+    test_agent_think_mode_apply();
+    test_agent_allow_glue();
     test_agent_flags_conflict();
     test_agent_parse_options_resume_flags();
     test_agent_session_list_query_empty_or_missing_dir();
@@ -11442,6 +11870,178 @@ static char *agent_render_config(agent_worker *w, const char *arg) {
     return agent_input_buf_take(&buf);
 }
 
+/* /model: a read-only summary of the active model configuration -- nothing
+ * here needs a new engine accessor, it's all already on agent_config/
+ * ds4_engine_options (see parse_options and the "backend=%s model=%s" trace
+ * line agent_worker_start already emits from the very same fields). Think
+ * mode is shown via effective_think_mode -- the same logic
+ * agent_worker_build_system_tokens and worker_run_turn use -- so a THINK_MAX
+ * request silently downgraded below DS4_THINK_MAX_MIN_CONTEXT shows up
+ * exactly as the live session would treat it, not as the raw configured
+ * value. */
+static char *agent_render_model(agent_worker *w, const char *arg) {
+    (void)arg;
+    const agent_config *cfg = w->cfg;
+    agent_input_buf buf = {0};
+    char line[256];
+
+    snprintf(line, sizeof(line), "Model: %s\n",
+             cfg->engine.model_path ? cfg->engine.model_path : "none");
+    agent_input_buf_append(&buf, line, strlen(line));
+
+    snprintf(line, sizeof(line), "Context: %d tokens\n", cfg->gen.ctx_size);
+    agent_input_buf_append(&buf, line, strlen(line));
+
+    ds4_think_mode configured = cfg->gen.think_mode;
+    ds4_think_mode effective = effective_think_mode(cfg);
+    if (configured == effective) {
+        snprintf(line, sizeof(line), "Think mode: %s\n", ds4_think_mode_name(effective));
+    } else {
+        snprintf(line, sizeof(line),
+                 "Think mode: %s (configured %s, downgraded below the max-think context floor)\n",
+                 ds4_think_mode_name(effective), ds4_think_mode_name(configured));
+    }
+    agent_input_buf_append(&buf, line, strlen(line));
+
+    if (cfg->gen.seed) {
+        snprintf(line, sizeof(line), "Sampling: temp=%.2f top_p=%.2f min_p=%.2f seed=%llu\n",
+                 (double)cfg->gen.temperature, (double)cfg->gen.top_p, (double)cfg->gen.min_p,
+                 (unsigned long long)cfg->gen.seed);
+    } else {
+        snprintf(line, sizeof(line), "Sampling: temp=%.2f top_p=%.2f min_p=%.2f seed=random\n",
+                 (double)cfg->gen.temperature, (double)cfg->gen.top_p, (double)cfg->gen.min_p);
+    }
+    agent_input_buf_append(&buf, line, strlen(line));
+
+    snprintf(line, sizeof(line), "Backend: %s\n", ds4_backend_name(cfg->engine.backend));
+    agent_input_buf_append(&buf, line, strlen(line));
+
+    return agent_input_buf_take(&buf);
+}
+
+/* Returns true iff needle is byte-for-byte present in the project scope's
+ * raw "permissions.allow" JSON array (scope 0, bypassing the project-then-
+ * user merge, see ds4_config_get_scoped). Because "permissions" is a
+ * whole-key wholesale-replace merge (see ds4_permissions.h), every
+ * settings-derived allow rule in a loaded ds4_permissions came from exactly
+ * one scope -- so in practice this either matches every settings-derived
+ * rule (project has a "permissions" key) or none of them (it doesn't, so
+ * ds4_permissions_load fell back to the user's) -- but checking the literal
+ * string is what's cheap, exact, and asked for, rather than leaning on that
+ * wholesale-replace invariant staying true forever. */
+static bool perm_allow_rule_in_project_scope(const ds4_config *cfg, const char *needle) {
+    const ds4_json_value *proj_perms = ds4_config_get_scoped(cfg, "permissions", 0);
+    if (!proj_perms) return false;
+    const ds4_json_value *arr = ds4_json_obj_get(proj_perms, "allow");
+    if (!arr || ds4_json_type_of(arr) != DS4_JSON_ARR) return false;
+    int n = ds4_json_arr_len(arr);
+    for (int i = 0; i < n; i++) {
+        const char *s = ds4_json_str(ds4_json_arr_get(arr, i));
+        if (s && !strcmp(s, needle)) return true;
+    }
+    return false;
+}
+
+/* /permissions: auto-approve flag, the confirm list, and every allow rule as
+ * "tool: pattern" tagged with its provenance: [project] or [user] for a
+ * settings-derived rule (see perm_allow_rule_in_project_scope), [session] for
+ * one appended this run via /allow (index >= ds4_permissions_settings_allow_len,
+ * set at load time -- see ds4_permissions.h). */
+static char *agent_render_permissions(agent_worker *w, const char *arg) {
+    (void)arg;
+    if (!w->perms) {
+        return xstrdup("No permissions configured (all tools run ungated). "
+                       "Add a permissions key to .ds4/settings.json.\n");
+    }
+
+    agent_input_buf buf = {0};
+    char line[512];
+
+    snprintf(line, sizeof(line), "Auto-approve: %s\n\n", w->cfg->auto_approve ? "on" : "off");
+    agent_input_buf_append(&buf, line, strlen(line));
+
+    int nconfirm = ds4_permissions_confirm_count(w->perms);
+    agent_input_buf_append(&buf, "Confirm:\n", strlen("Confirm:\n"));
+    if (nconfirm == 0) {
+        agent_input_buf_append(&buf, "  (none)\n", strlen("  (none)\n"));
+    } else {
+        for (int i = 0; i < nconfirm; i++) {
+            const char *tool = ds4_permissions_confirm_at(w->perms, i);
+            snprintf(line, sizeof(line), "  %s\n", tool ? tool : "");
+            agent_input_buf_append(&buf, line, strlen(line));
+        }
+    }
+
+    int nallow = ds4_permissions_allow_count(w->perms);
+    int settings_len = ds4_permissions_settings_allow_len(w->perms);
+    agent_input_buf_append(&buf, "\nAllow:\n", strlen("\nAllow:\n"));
+    if (nallow == 0) {
+        agent_input_buf_append(&buf, "  (none)\n", strlen("  (none)\n"));
+    } else {
+        for (int i = 0; i < nallow; i++) {
+            const char *tool = ds4_permissions_allow_tool_at(w->perms, i);
+            const char *pattern = ds4_permissions_allow_pattern_at(w->perms, i);
+            const char *tag;
+            if (i >= settings_len) {
+                tag = "session";
+            } else {
+                char needle[256];
+                snprintf(needle, sizeof(needle), "%s:%s", tool ? tool : "", pattern ? pattern : "");
+                tag = perm_allow_rule_in_project_scope(w->config, needle) ? "project" : "user";
+            }
+            snprintf(line, sizeof(line), "  %s: %s [%s]\n",
+                     tool ? tool : "", pattern ? pattern : "", tag);
+            agent_input_buf_append(&buf, line, strlen(line));
+        }
+    }
+
+    return agent_input_buf_take(&buf);
+}
+
+/* /hooks: per event (PreToolUse/PostToolUse), each entry as
+ * "matcher -> command (timeout Nms) [settings|plugin <name>]" -- origin comes
+ * straight from hook_entry.origin via ds4_hooks_entry_origin (see
+ * ds4_hooks.h/hk_parse_hooks_obj: NULL for a settings.json entry, the owning
+ * plugin's name for one loaded from that plugin's own hooks.json). */
+static char *agent_render_hooks(agent_worker *w, const char *arg) {
+    (void)arg;
+    if (!w->hooks) {
+        return xstrdup("No hooks configured. Add a hooks key to .ds4/settings.json "
+                       "or a plugin's hooks.json.\n");
+    }
+
+    static const struct { ds4_hook_event event; const char *label; } hook_events[] = {
+        { DS4_HOOK_PRE_TOOL, "PreToolUse" },
+        { DS4_HOOK_POST_TOOL, "PostToolUse" },
+    };
+
+    agent_input_buf buf = {0};
+    char line[512];
+    for (size_t e = 0; e < sizeof(hook_events) / sizeof(hook_events[0]); e++) {
+        ds4_hook_event event = hook_events[e].event;
+        int n = ds4_hooks_entry_count(w->hooks, event);
+        snprintf(line, sizeof(line), "%s (%d):\n", hook_events[e].label, n);
+        agent_input_buf_append(&buf, line, strlen(line));
+        if (n == 0) {
+            agent_input_buf_append(&buf, "  (none)\n", strlen("  (none)\n"));
+            continue;
+        }
+        for (int i = 0; i < n; i++) {
+            const char *matcher = ds4_hooks_entry_matcher(w->hooks, event, i);
+            const char *command = ds4_hooks_entry_command(w->hooks, event, i);
+            const char *origin = ds4_hooks_entry_origin(w->hooks, event, i);
+            int timeout_ms = ds4_hooks_entry_timeout_ms(w->hooks, event, i);
+            char tag[160];
+            if (origin) snprintf(tag, sizeof(tag), "plugin %s", origin);
+            else snprintf(tag, sizeof(tag), "settings");
+            snprintf(line, sizeof(line), "  %s \xe2\x86\x92 %s (timeout %dms) [%s]\n",
+                     matcher ? matcher : "", command ? command : "", timeout_ms, tag);
+            agent_input_buf_append(&buf, line, strlen(line));
+        }
+    }
+    return agent_input_buf_take(&buf);
+}
+
 /* Truncates desc to its first line, capped at ~80 bytes for a readable
  * listing line, without splitting a UTF-8 sequence (mirrors ds4_mcp's own
  * mcp_sanitize_desc truncation logic -- descriptions are already control-char/
@@ -11511,12 +12111,17 @@ static void runtime_help(void) {
     puts("  /commands    List user-defined slash commands.");
     puts("  /memory      Show loaded project memory (AGENTS.md/DS4.md).");
     puts("  /config      Show effective harness configuration.");
+    puts("  /model       Show model path, context, think mode, sampling, backend.");
+    puts("  /permissions Show effective permission policy (confirm/allow rules).");
+    puts("  /hooks       Show configured PreToolUse/PostToolUse hooks.");
+    puts("  /think       Show/switch think mode: nothink, think, or max.");
     puts("  /mcp [args]  Show MCP servers/tools; 'reconnect S' respawns a server.");
     puts("  /switch SHA  Load a saved session and show recent history.");
     puts("  /del SHA     Delete a saved session.");
     puts("  /strip SHA   Strip KV payload; /switch rebuilds it by prefill.");
     puts("  /history [N] Show N recent user turns from the current session.");
     puts("  /power N     Set GPU duty cycle percentage, 1..100.");
+    puts("  /allow T P   Add a session-only allow rule (tool T, pattern P).");
     puts("  /new         Start a fresh session from the system prompt.");
     puts("  /quit, /exit Exit.");
     puts("  Ctrl+C       Interrupt generation; clear edited text.");
@@ -12308,6 +12913,18 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                     char *rendered = agent_render_config(&worker, "");
                     fputs(rendered, stdout);
                     free(rendered);
+                } else if (!strcmp(cmd, "/model")) {
+                    char *rendered = agent_render_model(&worker, "");
+                    fputs(rendered, stdout);
+                    free(rendered);
+                } else if (!strcmp(cmd, "/permissions")) {
+                    char *rendered = agent_render_permissions(&worker, "");
+                    fputs(rendered, stdout);
+                    free(rendered);
+                } else if (!strcmp(cmd, "/hooks")) {
+                    char *rendered = agent_render_hooks(&worker, "");
+                    fputs(rendered, stdout);
+                    free(rendered);
                 } else if (!strncmp(cmd, "/skills", 7) &&
                            (cmd[7] == '\0' || cmd[7] == ' ' || cmd[7] == '\t')) {
                     char *arg = cmd + 7;
@@ -12461,6 +13078,57 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                         }
                     } else {
                         printf("usage: /mcp [reconnect <server>]\n");
+                    }
+                /* Switching cfg->gen.think_mode while the worker might be
+                 * mid-turn would apply inconsistently: worker_run_turn reads
+                 * effective_think_mode(cfg) once at the top of the turn (see
+                 * agent_think_mode_apply's own comment on DS4_THINK_MAX), so
+                 * a change mid-generation could take hold only partway
+                 * through a response. Bare "/think" (read-only) sits in this
+                 * same arm rather than the read-only group above it -- same
+                 * one-command-one-placement reasoning as /mcp's read-only
+                 * listing sharing an arm with its mutating "reconnect"
+                 * sibling just above. */
+                } else if (agent_slash_command_with_args(cmd, "/think")) {
+                    char *arg = cmd + 6;
+                    while (*arg == ' ' || *arg == '\t') arg++;
+                    if (!arg[0]) {
+                        ds4_think_mode effective = effective_think_mode(worker.cfg);
+                        if (worker.cfg->gen.think_mode == effective) {
+                            printf("think mode: %s\n", ds4_think_mode_name(effective));
+                        } else {
+                            printf("think mode: %s (configured %s, downgraded below the max-think context floor)\n",
+                                   ds4_think_mode_name(effective),
+                                   ds4_think_mode_name(worker.cfg->gen.think_mode));
+                        }
+                    } else {
+                        char msg[192];
+                        agent_think_mode_apply(worker.cfg, arg, msg, sizeof(msg));
+                        fputs(msg, stdout);
+                    }
+                /* Mutates worker.perms's in-memory allow array, which the
+                 * worker thread reads on every gated tool call
+                 * (ds4_permissions_check, from agent_execute_tool_call) --
+                 * placing this after the busy-gate keeps that read from ever
+                 * racing this write mid-turn, same rationale as /mcp
+                 * reconnect above. */
+                } else if (agent_slash_command_with_args(cmd, "/allow")) {
+                    char *arg = cmd + 6;
+                    while (*arg == ' ' || *arg == '\t') arg++;
+                    char *tool = arg;
+                    while (*arg && *arg != ' ' && *arg != '\t') arg++;
+                    if (*arg) { *arg = '\0'; arg++; }
+                    while (*arg == ' ' || *arg == '\t') arg++;
+                    char *pattern = arg;
+                    if (!tool[0] || !pattern[0]) {
+                        printf("usage: /allow <tool> <pattern>\n");
+                    } else if (!worker.perms) {
+                        printf("no permissions configured; /allow has no effect without a confirm list\n");
+                    } else if (ds4_permissions_add_allow(worker.perms, tool, pattern)) {
+                        printf("session allow added: %s: %s (not persisted; add to settings.json to keep)\n",
+                               tool, pattern);
+                    } else {
+                        printf("/allow failed (out of memory)\n");
                     }
                 } else if (cmd[0] == '/' &&
                            agent_split_first_word(cmd, cmdword, sizeof(cmdword), &cmdargs) &&

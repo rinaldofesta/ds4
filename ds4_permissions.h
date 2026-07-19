@@ -1,6 +1,7 @@
 #ifndef DS4_PERMISSIONS_H
 #define DS4_PERMISSIONS_H
 #include <stddef.h>
+#include <stdbool.h>
 #include "ds4_config.h"
 
 /* Opt-in confirm gate + allowlist for risky tools. Registered in
@@ -38,6 +39,29 @@ void ds4_permissions_free(ds4_permissions *p);
 
 int ds4_permissions_confirm_count(const ds4_permissions *p); /* 0 if p NULL */
 int ds4_permissions_allow_count(const ds4_permissions *p);   /* 0 if p NULL */
+
+/* Per-entry accessors for introspection (ds4-agent's /permissions command).
+ * NULL/out-of-range i are tolerated the same way the *_count functions
+ * tolerate p==NULL: they return NULL, never crash. */
+const char *ds4_permissions_confirm_at(const ds4_permissions *p, int i);
+const char *ds4_permissions_allow_tool_at(const ds4_permissions *p, int i);
+const char *ds4_permissions_allow_pattern_at(const ds4_permissions *p, int i);
+
+/* Number of allow rules that came from settings.json at load time -- indices
+ * [0, settings_allow_len) are settings-derived; indices
+ * [settings_allow_len, ds4_permissions_allow_count(p)) were appended later by
+ * ds4_permissions_add_allow (session-only, see below). 0 if p NULL. */
+int ds4_permissions_settings_allow_len(const ds4_permissions *p);
+
+/* Appends one allow rule ("<tool>:<pattern>", already split) to p's in-memory
+ * allow array -- session-scoped: never written back to settings.json, and
+ * gone the moment the process exits. Used by ds4-agent's "/allow <tool>
+ * <pattern>" to loosen a confirm-gated tool for the rest of the run without
+ * editing config. Returns false (no-op) if p, tool, or pattern is NULL, or
+ * tool is empty; true on success (false only otherwise on allocation
+ * failure). Not idempotent -- adding the same rule twice appends it twice,
+ * which is harmless since ds4_permissions_check stops at the first match. */
+bool ds4_permissions_add_allow(ds4_permissions *p, const char *tool, const char *pattern);
 
 /* Pure decision: ALLOW if p NULL, tool not in confirm, or an allow rule
  * matches (tool exact + fnmatch(pattern, subject)). ASK otherwise. */

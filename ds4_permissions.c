@@ -33,6 +33,8 @@ struct ds4_permissions {
     int confirm_len;
     allow_rule *allow;
     int allow_len;
+    int allow_cap;         /* tracked post-load too, so add_allow can grow the array */
+    int settings_allow_len; /* allow_len as loaded from settings.json, before any add_allow */
 };
 
 ds4_permissions *ds4_permissions_load(const ds4_config *cfg, char *warn, size_t warn_len) {
@@ -127,6 +129,8 @@ ds4_permissions *ds4_permissions_load(const ds4_config *cfg, char *warn, size_t 
     p->confirm_len = confirm_len;
     p->allow = allow;
     p->allow_len = allow_len;
+    p->allow_cap = allow_cap;
+    p->settings_allow_len = allow_len;
     return p;
 }
 
@@ -148,6 +152,51 @@ int ds4_permissions_confirm_count(const ds4_permissions *p) {
 
 int ds4_permissions_allow_count(const ds4_permissions *p) {
     return p ? p->allow_len : 0;
+}
+
+const char *ds4_permissions_confirm_at(const ds4_permissions *p, int i) {
+    if (!p || i < 0 || i >= p->confirm_len) return NULL;
+    return p->confirm[i];
+}
+
+const char *ds4_permissions_allow_tool_at(const ds4_permissions *p, int i) {
+    if (!p || i < 0 || i >= p->allow_len) return NULL;
+    return p->allow[i].tool;
+}
+
+const char *ds4_permissions_allow_pattern_at(const ds4_permissions *p, int i) {
+    if (!p || i < 0 || i >= p->allow_len) return NULL;
+    return p->allow[i].pattern;
+}
+
+int ds4_permissions_settings_allow_len(const ds4_permissions *p) {
+    return p ? p->settings_allow_len : 0;
+}
+
+bool ds4_permissions_add_allow(ds4_permissions *p, const char *tool, const char *pattern) {
+    if (!p || !tool || !tool[0] || !pattern) return false;
+    char *tool_dup = pm_strdup(tool);
+    char *pattern_dup = pm_strdup(pattern);
+    if (!tool_dup || !pattern_dup) {
+        free(tool_dup);
+        free(pattern_dup);
+        return false;
+    }
+    if (p->allow_len == p->allow_cap) {
+        int new_cap = p->allow_cap ? p->allow_cap * 2 : 4;
+        allow_rule *grown = realloc(p->allow, (size_t)new_cap * sizeof(*grown));
+        if (!grown) {
+            free(tool_dup);
+            free(pattern_dup);
+            return false;
+        }
+        p->allow = grown;
+        p->allow_cap = new_cap;
+    }
+    p->allow[p->allow_len].tool = tool_dup;
+    p->allow[p->allow_len].pattern = pattern_dup;
+    p->allow_len++;
+    return true;
 }
 
 ds4_perm_decision ds4_permissions_check(const ds4_permissions *p,
@@ -484,12 +533,130 @@ static void test_wholesale_override(void) {
     pmt_teardown(fx, home, saved_home);
 }
 
+/* Entry accessors: p==NULL degrades exactly like the *_count functions;
+ * a loaded handle round-trips confirm/allow entries by index; negative and
+ * >=count indices are OOB-tolerant (NULL), never a crash. */
+static void test_permissions_entry_accessors_null_and_oob(void) {
+    PERMS_TEST_ASSERT(ds4_permissions_confirm_at(NULL, 0) == NULL);
+    PERMS_TEST_ASSERT(ds4_permissions_allow_tool_at(NULL, 0) == NULL);
+    PERMS_TEST_ASSERT(ds4_permissions_allow_pattern_at(NULL, 0) == NULL);
+    PERMS_TEST_ASSERT(ds4_permissions_settings_allow_len(NULL) == 0);
+
+    char *fx, *home, *saved_home;
+    ds4_config *cfg = pmt_setup(
+        "{\"permissions\":{\"confirm\":[\"bash\",\"write\"],\"allow\":[\"bash:make *\"]}}",
+        NULL, &fx, &home, &saved_home);
+    PERMS_TEST_ASSERT(cfg != NULL);
+    if (cfg) {
+        char warn[256] = {0};
+        ds4_permissions *p = ds4_permissions_load(cfg, warn, sizeof(warn));
+        PERMS_TEST_ASSERT(p != NULL);
+        if (p) {
+            const char *c0 = ds4_permissions_confirm_at(p, 0);
+            const char *c1 = ds4_permissions_confirm_at(p, 1);
+            PERMS_TEST_ASSERT(c0 != NULL && !strcmp(c0, "bash"));
+            PERMS_TEST_ASSERT(c1 != NULL && !strcmp(c1, "write"));
+            PERMS_TEST_ASSERT(ds4_permissions_confirm_at(p, -1) == NULL);
+            PERMS_TEST_ASSERT(ds4_permissions_confirm_at(p, 2) == NULL);
+
+            const char *tool0 = ds4_permissions_allow_tool_at(p, 0);
+            const char *pat0 = ds4_permissions_allow_pattern_at(p, 0);
+            PERMS_TEST_ASSERT(tool0 != NULL && !strcmp(tool0, "bash"));
+            PERMS_TEST_ASSERT(pat0 != NULL && !strcmp(pat0, "make *"));
+            PERMS_TEST_ASSERT(ds4_permissions_allow_tool_at(p, -1) == NULL);
+            PERMS_TEST_ASSERT(ds4_permissions_allow_tool_at(p, 1) == NULL);
+            PERMS_TEST_ASSERT(ds4_permissions_allow_pattern_at(p, 1) == NULL);
+
+            ds4_permissions_free(p);
+        }
+    }
+    ds4_config_free(cfg);
+    pmt_teardown(fx, home, saved_home);
+}
+
+/* ds4_permissions_add_allow appends a session-only rule; settings_allow_len
+ * (the boundary /permissions tags [session] past) stays fixed at whatever was
+ * loaded from settings.json, regardless of how many rules get added
+ * afterward. The added rule flips a previously-ASK subject to ALLOW without
+ * disturbing the pre-existing settings rule. */
+static void test_add_allow_session_rule(void) {
+    char *fx, *home, *saved_home;
+    ds4_config *cfg = pmt_setup(
+        "{\"permissions\":{\"confirm\":[\"bash\"],\"allow\":[\"bash:git status*\"]}}",
+        NULL, &fx, &home, &saved_home);
+    PERMS_TEST_ASSERT(cfg != NULL);
+    if (cfg) {
+        char warn[256] = {0};
+        ds4_permissions *p = ds4_permissions_load(cfg, warn, sizeof(warn));
+        PERMS_TEST_ASSERT(p != NULL);
+        if (p) {
+            PERMS_TEST_ASSERT(ds4_permissions_allow_count(p) == 1);
+            PERMS_TEST_ASSERT(ds4_permissions_settings_allow_len(p) == 1);
+
+            PERMS_TEST_ASSERT(ds4_permissions_check(p, "bash", "make test") == DS4_PERM_ASK);
+
+            PERMS_TEST_ASSERT(ds4_permissions_add_allow(p, "bash", "make *"));
+            PERMS_TEST_ASSERT(ds4_permissions_allow_count(p) == 2);
+            PERMS_TEST_ASSERT(ds4_permissions_settings_allow_len(p) == 1);
+
+            PERMS_TEST_ASSERT(ds4_permissions_check(p, "bash", "make test") == DS4_PERM_ALLOW);
+            PERMS_TEST_ASSERT(ds4_permissions_check(p, "bash", "git status -s") == DS4_PERM_ALLOW);
+
+            const char *tool1 = ds4_permissions_allow_tool_at(p, 1);
+            const char *pattern1 = ds4_permissions_allow_pattern_at(p, 1);
+            PERMS_TEST_ASSERT(tool1 != NULL && !strcmp(tool1, "bash"));
+            PERMS_TEST_ASSERT(pattern1 != NULL && !strcmp(pattern1, "make *"));
+
+            /* Rejected calls (empty/NULL tool, NULL pattern, NULL p) add nothing. */
+            PERMS_TEST_ASSERT(!ds4_permissions_add_allow(p, "", "x"));
+            PERMS_TEST_ASSERT(!ds4_permissions_add_allow(p, NULL, "x"));
+            PERMS_TEST_ASSERT(!ds4_permissions_add_allow(p, "bash", NULL));
+            PERMS_TEST_ASSERT(!ds4_permissions_add_allow(NULL, "bash", "x"));
+            PERMS_TEST_ASSERT(ds4_permissions_allow_count(p) == 2);
+
+            ds4_permissions_free(p);
+        }
+    }
+    ds4_config_free(cfg);
+    pmt_teardown(fx, home, saved_home);
+}
+
+/* Same, starting from zero settings-derived allow rules (no "allow" key at
+ * all -- allow_cap starts at 0), to exercise add_allow's own grow-from-empty
+ * path independently of ds4_permissions_load's. */
+static void test_add_allow_with_no_settings_allow(void) {
+    char *fx, *home, *saved_home;
+    ds4_config *cfg = pmt_setup(
+        "{\"permissions\":{\"confirm\":[\"bash\"]}}",
+        NULL, &fx, &home, &saved_home);
+    PERMS_TEST_ASSERT(cfg != NULL);
+    if (cfg) {
+        char warn[256] = {0};
+        ds4_permissions *p = ds4_permissions_load(cfg, warn, sizeof(warn));
+        PERMS_TEST_ASSERT(p != NULL);
+        if (p) {
+            PERMS_TEST_ASSERT(ds4_permissions_settings_allow_len(p) == 0);
+            PERMS_TEST_ASSERT(ds4_permissions_check(p, "bash", "anything") == DS4_PERM_ASK);
+            PERMS_TEST_ASSERT(ds4_permissions_add_allow(p, "bash", "*"));
+            PERMS_TEST_ASSERT(ds4_permissions_check(p, "bash", "anything") == DS4_PERM_ALLOW);
+            PERMS_TEST_ASSERT(ds4_permissions_settings_allow_len(p) == 0);
+            PERMS_TEST_ASSERT(ds4_permissions_allow_count(p) == 1);
+            ds4_permissions_free(p);
+        }
+    }
+    ds4_config_free(cfg);
+    pmt_teardown(fx, home, saved_home);
+}
+
 int ds4_permissions_unit_tests_run(void) {
     test_no_permissions_key();
     test_confirm_gating();
     test_allow_patterns();
     test_empty_subject();
     test_wholesale_override();
+    test_permissions_entry_accessors_null_and_oob();
+    test_add_allow_session_rule();
+    test_add_allow_with_no_settings_allow();
     return perms_test_failures;
 }
 

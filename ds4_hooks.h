@@ -68,6 +68,19 @@ ds4_hooks *ds4_hooks_load(const ds4_config *cfg, char *warn, size_t warn_len);
 void ds4_hooks_free(ds4_hooks *h);
 int  ds4_hooks_count(const ds4_hooks *h, ds4_hook_event event); /* 0 if h NULL */
 
+/* Per-entry accessors for introspection (ds4-agent's /hooks command).
+ * ds4_hooks_entry_count is an alias of ds4_hooks_count. h NULL or i out of
+ * [0, count) is tolerated everywhere: the *_at-style accessors return NULL
+ * (0 for timeout_ms), never crash. origin is NULL for an entry parsed from
+ * settings.json's "hooks" key, or the owning plugin's name (see
+ * ds4_config_root_plugin_name) for one parsed from that plugin's own
+ * hooks.json -- set once at load time in ds4_hooks_load. */
+int ds4_hooks_entry_count(const ds4_hooks *h, ds4_hook_event event);
+const char *ds4_hooks_entry_matcher(const ds4_hooks *h, ds4_hook_event event, int i);
+const char *ds4_hooks_entry_command(const ds4_hooks *h, ds4_hook_event event, int i);
+const char *ds4_hooks_entry_origin(const ds4_hooks *h, ds4_hook_event event, int i);
+int ds4_hooks_entry_timeout_ms(const ds4_hooks *h, ds4_hook_event event, int i);
+
 typedef struct {
     bool blocked;          /* some hook exited 2 */
     char *block_reason;    /* captured stderr of the blocking hook (trimmed, capped), may be "" */
