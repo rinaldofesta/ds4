@@ -611,6 +611,17 @@ KV bootstrap is content-addressed (`sysprompt-<hash>.kv`), so each
 project/config combination keeps its own warm prefill cache; stale entries
 are garbage collected automatically.
 
+**Cockpit commands**: the harness state is inspectable from inside the
+REPL. `/skills [name]`, `/commands`, `/memory` and `/config` show what is
+loaded (with per-item provenance: project, user, plugin, session);
+`/mcp` lists servers and their tools, and `/mcp reconnect <server>`
+respawns one in place; `/model` and `/think [mode]` show engine info and
+switch the thinking mode at runtime (think max applies from the next
+`/new` or `/compact`); `/permissions`, `/hooks` and `/allow <tool>
+<pattern>` inspect and extend the permission gate for the session. Tab
+completes slash commands and their arguments, and the status line shows
+the think mode, skill count, MCP servers up, and the active session.
+
 ## Benchmarking
 
 `ds4-bench` measures instantaneous prefill and generation throughput at context
