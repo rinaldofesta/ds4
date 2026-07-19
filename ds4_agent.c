@@ -114,6 +114,16 @@ typedef struct {
     ds4_config *config;
     ds4_skill_list skills;
     ds4_mcp_registry *mcp;
+    /* Cached alive-server count for the statusline (see
+     * agent_statusline_harness_segment/agent_mcp_refresh_alive_cache): the
+     * total is a free O(1) registry accessor, but "how many are alive" needs
+     * a loop over every server, which the redraw path must never do. Written
+     * only by agent_mcp_refresh_alive_cache(), at worker init, after /mcp
+     * reconnect (both on the UI thread), and after an MCP tool call
+     * completes (worker thread) -- the last of those can only ever run while
+     * the UI thread's busy-gate keeps /mcp reconnect from running, so the two
+     * threads are never writing it at the same time. */
+    int mcp_up_cached;
     ds4_hooks *hooks;
     ds4_permissions *perms;
     char *project_memory_text; /* loaded AGENTS.md/DS4.md content, NULL if none/blank */
@@ -353,6 +363,7 @@ static agent_worker *agent_completion_worker;
 static ds4_command_list g_agent_commands;
 
 static void worker_apply_pending_power(agent_worker *w);
+static void agent_mcp_refresh_alive_cache(agent_worker *w);
 static void agent_trace(agent_worker *w, const char *fmt, ...);
 static void agent_trace_text(agent_worker *w, const char *label,
                              const char *text, size_t len);
@@ -527,6 +538,47 @@ static bool agent_slash_command_known(const char *cmd) {
     return agent_split_first_word(cmd, word, sizeof(word), &rest) &&
            ds4_commands_known(&g_agent_commands, word);
 }
+
+/* Tab-completion source of truth for first-word completion: every built-in
+ * name agent_slash_command_known() recognizes above, plus whether the
+ * dispatch chain accepts a trailing argument for it (mirrors that function's
+ * own agent_slash_command_with_args() calls). Kept in sync BY HAND rather
+ * than unifying with agent_slash_command_known() -- that seam is already
+ * established and this avoids churning it for a completion nicety; update
+ * both places together when a built-in is added, renamed, or removed.
+ * takes_args isn't read by agent_complete_candidates() today (only
+ * /skills, /think, /mcp, /switch, /del, /strip actually complete an
+ * argument) -- kept accurate for whichever built-in gets argument
+ * completion next. */
+typedef struct {
+    const char *name; /* without the leading '/' */
+    bool takes_args;
+} agent_builtin_command;
+
+static const agent_builtin_command agent_builtin_commands[] = {
+    { "help", false },
+    { "save", false },
+    { "compact", false },
+    { "list", false },
+    { "quit", false },
+    { "exit", false },
+    { "new", false },
+    { "commands", false },
+    { "memory", false },
+    { "config", false },
+    { "model", false },
+    { "permissions", false },
+    { "hooks", false },
+    { "power", true },
+    { "switch", true },
+    { "del", true },
+    { "strip", true },
+    { "history", true },
+    { "skills", true },
+    { "mcp", true },
+    { "think", true },
+    { "allow", true },
+};
 
 static uint64_t parse_u64(const char *s, const char *opt) {
     char *end = NULL;
@@ -5550,93 +5602,192 @@ static void agent_worker_list_sessions(agent_worker *w) {
     agent_session_list_free(sessions, sessions_len);
 }
 
+/* ----------------------------------------------------------------------
+ * Tab completion
+ *
+ * agent_complete_candidates() is the pure candidate generator: given the
+ * live input line and a small read-only ctx, it returns full replacement
+ * lines for linenoise (its own contract: each candidate replaces the whole
+ * edited line), sorted deterministically. It reads agent_builtin_commands/
+ * g_agent_commands directly -- the same free-function-reads-file-scope-table
+ * precedent agent_slash_command_known() already established above -- rather
+ * than threading them through ctx, so ctx only carries the state that
+ * genuinely varies per call/per test: the skills list, the MCP registry, and
+ * a session-list snapshot for /switch|/del|/strip.
+ *
+ * agent_completion_callback() is the thin linenoise adapter below it: it
+ * fetches that session snapshot fresh on every Tab via
+ * agent_session_list_query() (an opendir()+readdir() scan -- fine at
+ * keypress frequency, never done from the redraw path), builds ctx from the
+ * live worker, and feeds each candidate to linenoiseAddCompletion(). */
 typedef struct {
-    char sha[41];
-    uint64_t last_used;
-} agent_completion_session;
+    const ds4_skill_list *skills;             /* NULL/empty -> no /skills candidates */
+    const ds4_mcp_registry *mcp;              /* NULL -> no /mcp reconnect candidates */
+    const agent_session_list_item *sessions;  /* recency-sorted snapshot */
+    int sessions_len;
+} agent_complete_ctx;
 
-typedef struct {
-    agent_completion_session *v;
-    int len;
-    int cap;
-} agent_completion_sessions;
-
-static void agent_completion_sessions_push(agent_completion_sessions *s,
-                                           const char sha[41],
-                                           uint64_t last_used) {
-    if (s->len == s->cap) {
-        s->cap = s->cap ? s->cap * 2 : 16;
-        s->v = xrealloc(s->v, (size_t)s->cap * sizeof(s->v[0]));
+static void agent_complete_push(char ***v, int *len, int *cap, const char *full) {
+    if (*len == *cap) {
+        *cap = *cap ? *cap * 2 : 8;
+        *v = xrealloc(*v, (size_t)*cap * sizeof(char *));
     }
-    memcpy(s->v[s->len].sha, sha, 41);
-    s->v[s->len].last_used = last_used;
-    s->len++;
+    (*v)[(*len)++] = xstrdup(full);
 }
 
-static int agent_completion_session_cmp(const void *a, const void *b) {
-    const agent_completion_session *sa = a, *sb = b;
-    if (sa->last_used < sb->last_used) return 1;
-    if (sa->last_used > sb->last_used) return -1;
-    return strcmp(sa->sha, sb->sha);
+static int agent_complete_name_cmp(const void *a, const void *b) {
+    return strcmp(*(char * const *)a, *(char * const *)b);
 }
 
-/* Tab completion for /switch.  Suggestions are sorted by recent use and accept
- * either an empty prefix or any unambiguous hex prefix. */
-static void agent_switch_completion_callback(const char *buf,
-                                             linenoiseCompletions *lc) {
-    agent_worker *w = agent_completion_worker;
-    static const char cmd[] = "/switch";
-    const size_t cmd_len = sizeof(cmd) - 1;
-    if (!w || !buf || strncmp(buf, cmd, cmd_len) != 0) return;
+/* First-word completion: every built-in plus every discovered file command,
+ * prefix-filtered against the whole line (which IS the first word here --
+ * agent_complete_candidates only reaches this when Tab found no space yet)
+ * and alphabetically sorted. */
+static void agent_complete_first_word(const char *line, char ***v, int *len, int *cap) {
+    size_t line_len = strlen(line);
+    size_t n = sizeof(agent_builtin_commands) / sizeof(agent_builtin_commands[0]);
+    for (size_t i = 0; i < n; i++) {
+        char full[64];
+        snprintf(full, sizeof(full), "/%s", agent_builtin_commands[i].name);
+        if (!strncmp(full, line, line_len)) agent_complete_push(v, len, cap, full);
+    }
+    for (int i = 0; i < g_agent_commands.len; i++) {
+        char full[160];
+        snprintf(full, sizeof(full), "/%s", g_agent_commands.v[i].name);
+        if (!strncmp(full, line, line_len)) agent_complete_push(v, len, cap, full);
+    }
+    if (*len) qsort(*v, (size_t)*len, sizeof(char *), agent_complete_name_cmp);
+}
 
-    const char *p = buf + cmd_len;
-    if (*p && *p != ' ' && *p != '\t') return;
-    while (*p == ' ' || *p == '\t') p++;
-
-    const char *prefix = p;
+/* /switch, /del, /strip share the same argument shape: a sha prefix matched
+ * against a recency-sorted session snapshot (fetched by the caller -- see
+ * agent_completion_callback below). Preserves that recency order rather than
+ * re-sorting alphabetically, since most-recently-used first is the useful
+ * order for picking a session. Offers the short 8-char form unless the user
+ * has already typed past it, matching /switch's own long-standing behavior
+ * (this used to be agent_switch_completion_callback's own opendir/readdir
+ * scan; it now reuses agent_session_list_query's already-tested one instead
+ * of duplicating it, and extends the same completion to /del and /strip). */
+static void agent_complete_session_arg(const char *word, const char *prefix,
+                                       const agent_complete_ctx *ctx,
+                                       char ***v, int *len, int *cap) {
     size_t prefix_len = strlen(prefix);
+    if (prefix_len > 40) return;
     for (size_t i = 0; i < prefix_len; i++) {
         if (!isxdigit((unsigned char)prefix[i])) return;
     }
-    if (prefix_len > 40) return;
 
-    DIR *d = opendir(w->cache_dir);
-    if (!d) return;
-
-    agent_completion_sessions sessions = {0};
-    const uint8_t model_id = (uint8_t)ds4_engine_model_id(w->engine);
-    struct dirent *de;
-    while ((de = readdir(d)) != NULL) {
-        char sha[41];
-        if (!ds4_kvstore_sha_hex_name(de->d_name, sha)) continue;
+    int sha_chars = prefix_len > 8 ? 40 : 8;
+    for (int i = 0; i < ctx->sessions_len; i++) {
+        const char *sha = ctx->sessions[i].entry.sha;
         if (prefix_len && strncasecmp(sha, prefix, prefix_len) != 0) continue;
+        char full[64];
+        snprintf(full, sizeof(full), "%s %.*s", word, sha_chars, sha);
+        agent_complete_push(v, len, cap, full);
+    }
+}
 
-        uint64_t last_used = 0;
-        char *path = ds4_kvstore_path_join(w->cache_dir, de->d_name);
-        ds4_kvstore_entry e = {0};
-        if (ds4_kvstore_read_entry_file(path, sha, &e)) {
-            if (e.model_id == model_id) last_used = e.last_used;
-            else last_used = UINT64_MAX;
-            ds4_kvstore_entry_free(&e);
-        } else {
-            last_used = UINT64_MAX;
+static int agent_complete_candidates(const char *line, const agent_complete_ctx *ctx,
+                                     char ***out) {
+    *out = NULL;
+    if (!line || line[0] != '/') return 0;
+
+    char **v = NULL;
+    int len = 0, cap = 0;
+    const char *sp = strchr(line, ' ');
+
+    if (!sp) {
+        agent_complete_first_word(line, &v, &len, &cap);
+        *out = v;
+        return len;
+    }
+
+    size_t word_len = (size_t)(sp - line);
+    char word[32];
+    if (word_len >= sizeof(word)) return 0;
+    memcpy(word, line, word_len);
+    word[word_len] = '\0';
+
+    const char *arg = sp + 1;
+    while (*arg == ' ' || *arg == '\t') arg++;
+    size_t arg_len = strlen(arg);
+
+    if (!strcmp(word, "/skills")) {
+        if (ctx && ctx->skills) {
+            for (int i = 0; i < ctx->skills->len; i++) {
+                const char *name = ctx->skills->v[i].name;
+                if (!strncmp(name, arg, arg_len)) {
+                    char full[192];
+                    snprintf(full, sizeof(full), "/skills %s", name);
+                    agent_complete_push(&v, &len, &cap, full);
+                }
+            }
+            if (len) qsort(v, (size_t)len, sizeof(char *), agent_complete_name_cmp);
         }
-        free(path);
-        if (last_used == UINT64_MAX) continue;
-        agent_completion_sessions_push(&sessions, sha, last_used);
+    } else if (!strcmp(word, "/think")) {
+        static const char *modes[] = { "max", "nothink", "think" }; /* already alphabetical */
+        for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
+            if (!strncmp(modes[i], arg, arg_len)) {
+                char full[32];
+                snprintf(full, sizeof(full), "/think %s", modes[i]);
+                agent_complete_push(&v, &len, &cap, full);
+            }
+        }
+    } else if (!strcmp(word, "/mcp") && ctx && ctx->mcp) {
+        static const char recon[] = "reconnect";
+        size_t rlen = sizeof(recon) - 1;
+        if (arg_len > rlen && !strncmp(arg, recon, rlen) &&
+            (arg[rlen] == ' ' || arg[rlen] == '\t'))
+        {
+            const char *sprefix = arg + rlen;
+            while (*sprefix == ' ' || *sprefix == '\t') sprefix++;
+            size_t sp_len = strlen(sprefix);
+            int nservers = ds4_mcp_registry_server_count(ctx->mcp);
+            for (int i = 0; i < nservers; i++) {
+                const char *name = ds4_mcp_registry_server_name(ctx->mcp, i);
+                if (name && !strncmp(name, sprefix, sp_len)) {
+                    char full[192];
+                    snprintf(full, sizeof(full), "/mcp reconnect %s", name);
+                    agent_complete_push(&v, &len, &cap, full);
+                }
+            }
+            if (len) qsort(v, (size_t)len, sizeof(char *), agent_complete_name_cmp);
+        }
+    } else if ((!strcmp(word, "/switch") || !strcmp(word, "/del") || !strcmp(word, "/strip")) &&
+              ctx && ctx->sessions)
+    {
+        agent_complete_session_arg(word, arg, ctx, &v, &len, &cap);
     }
-    closedir(d);
 
-    qsort(sessions.v, (size_t)sessions.len, sizeof(sessions.v[0]),
-          agent_completion_session_cmp);
-    for (int i = 0; i < sessions.len; i++) {
-        char line[64];
-        int sha_chars = prefix_len > 8 ? 40 : 8;
-        snprintf(line, sizeof(line), "/switch %.*s",
-                 sha_chars, sessions.v[i].sha);
-        linenoiseAddCompletion(lc, line);
+    *out = v;
+    return len;
+}
+
+/* linenoise Tab callback: thin adapter over agent_complete_candidates()
+ * above. */
+static void agent_completion_callback(const char *buf, linenoiseCompletions *lc) {
+    agent_worker *w = agent_completion_worker;
+    if (!w || !buf) return;
+
+    agent_session_list_item *sessions = NULL;
+    int sessions_len = agent_session_list_query(w, &sessions, NULL);
+    if (sessions_len < 0) sessions_len = 0;
+
+    agent_complete_ctx ctx = {
+        .skills = &w->skills,
+        .mcp = w->mcp,
+        .sessions = sessions,
+        .sessions_len = sessions_len,
+    };
+
+    char **candidates = NULL;
+    int n = agent_complete_candidates(buf, &ctx, &candidates);
+    for (int i = 0; i < n; i++) {
+        linenoiseAddCompletion(lc, candidates[i]);
+        free(candidates[i]);
     }
-    free(sessions.v);
+    free(candidates);
+    agent_session_list_free(sessions, sessions_len);
 }
 
 /* Resolve a user-provided SHA prefix to exactly one saved session file. */
@@ -6690,6 +6841,7 @@ static char *agent_render_hooks(agent_worker *w, const char *arg);
 /* agent_think_mode_apply is NOT forward declared here: it's pure config
  * logic defined right next to effective_think_mode, well above this test
  * block, so it's already visible by this point. */
+static void agent_statusline_harness_segment(agent_worker *w, char *buf, size_t len);
 
 static void test_agent_tool_skill_dispatch(void) {
     char tmpl[] = "/tmp/ds4_agent_skill_dispatch_test.XXXXXX";
@@ -8176,6 +8328,362 @@ static void test_agent_sysprompt_cache_gc_missing_or_empty_dir(void) {
     rmdir(fx);
 }
 
+/* agent_complete_candidates: a line that isn't a slash command (empty or
+ * otherwise) offers nothing, regardless of ctx. */
+static void test_agent_complete_candidates_non_slash_and_empty(void) {
+    char **out = NULL;
+    AGENT_TEST_ASSERT(agent_complete_candidates("", NULL, &out) == 0);
+    AGENT_TEST_ASSERT(out == NULL);
+    AGENT_TEST_ASSERT(agent_complete_candidates("hello", NULL, &out) == 0);
+    AGENT_TEST_ASSERT(out == NULL);
+}
+
+/* First-word completion: "/" offers every built-in plus every discovered
+ * file command, sorted; a narrower prefix like "/sk" narrows to the single
+ * match. Mirrors test_agent_slash_command_known_file_commands' own
+ * g_agent_commands fixture pattern. */
+static void test_agent_complete_candidates_first_word_all_and_prefix(void) {
+    g_agent_commands.v = xmalloc(sizeof(ds4_command_meta));
+    g_agent_commands.len = 1;
+    g_agent_commands.cap = 1;
+    g_agent_commands.v[0].name = xstrdup("zzz-custom");
+    g_agent_commands.v[0].path = xstrdup("/nonexistent/zzz-custom.md");
+
+    char **out = NULL;
+    int n = agent_complete_candidates("/", NULL, &out);
+    size_t nbuiltins = sizeof(agent_builtin_commands) / sizeof(agent_builtin_commands[0]);
+    AGENT_TEST_ASSERT((size_t)n == nbuiltins + 1);
+    for (int i = 1; i < n; i++) AGENT_TEST_ASSERT(strcmp(out[i - 1], out[i]) < 0);
+    bool found_custom = false;
+    for (int i = 0; i < n; i++) {
+        if (!strcmp(out[i], "/zzz-custom")) found_custom = true;
+    }
+    AGENT_TEST_ASSERT(found_custom);
+    for (int i = 0; i < n; i++) free(out[i]);
+    free(out);
+
+    out = NULL;
+    n = agent_complete_candidates("/sk", NULL, &out);
+    AGENT_TEST_ASSERT(n == 1);
+    if (n == 1) AGENT_TEST_ASSERT(!strcmp(out[0], "/skills"));
+    for (int i = 0; i < n; i++) free(out[i]);
+    free(out);
+
+    ds4_commands_list_free(&g_agent_commands);
+}
+
+/* /skills <name> argument completion: "/skills " (empty prefix) lists every
+ * fixture skill sorted; "/skills co" narrows to the two whose name starts
+ * with "co". */
+static void test_agent_complete_candidates_skills_arg(void) {
+    ds4_skill_list skills = {0};
+    skills.v = xmalloc(sizeof(ds4_skill_meta) * 3);
+    skills.len = 3;
+    skills.cap = 3;
+    skills.v[0].name = xstrdup("code-review");
+    skills.v[0].description = xstrdup("d1");
+    skills.v[0].dir = xstrdup("/nonexistent/a");
+    skills.v[1].name = xstrdup("commit-helper");
+    skills.v[1].description = xstrdup("d2");
+    skills.v[1].dir = xstrdup("/nonexistent/b");
+    skills.v[2].name = xstrdup("docs");
+    skills.v[2].description = xstrdup("d3");
+    skills.v[2].dir = xstrdup("/nonexistent/c");
+
+    agent_complete_ctx ctx = {0};
+    ctx.skills = &skills;
+
+    char **out = NULL;
+    int n = agent_complete_candidates("/skills ", &ctx, &out);
+    AGENT_TEST_ASSERT(n == 3);
+    if (n == 3) {
+        AGENT_TEST_ASSERT(!strcmp(out[0], "/skills code-review"));
+        AGENT_TEST_ASSERT(!strcmp(out[1], "/skills commit-helper"));
+        AGENT_TEST_ASSERT(!strcmp(out[2], "/skills docs"));
+    }
+    for (int i = 0; i < n; i++) free(out[i]);
+    free(out);
+
+    out = NULL;
+    n = agent_complete_candidates("/skills co", &ctx, &out);
+    AGENT_TEST_ASSERT(n == 2);
+    if (n == 2) {
+        AGENT_TEST_ASSERT(!strcmp(out[0], "/skills code-review"));
+        AGENT_TEST_ASSERT(!strcmp(out[1], "/skills commit-helper"));
+    }
+    for (int i = 0; i < n; i++) free(out[i]);
+    free(out);
+
+    ds4_skills_list_free(&skills);
+}
+
+/* /think <mode> argument completion: the three modes, already alphabetical. */
+static void test_agent_complete_candidates_think_modes(void) {
+    char **out = NULL;
+    int n = agent_complete_candidates("/think ", NULL, &out);
+    AGENT_TEST_ASSERT(n == 3);
+    if (n == 3) {
+        AGENT_TEST_ASSERT(!strcmp(out[0], "/think max"));
+        AGENT_TEST_ASSERT(!strcmp(out[1], "/think nothink"));
+        AGENT_TEST_ASSERT(!strcmp(out[2], "/think think"));
+    }
+    for (int i = 0; i < n; i++) free(out[i]);
+    free(out);
+}
+
+/* /mcp reconnect <server> argument completion against a real registry --
+ * the same mock_mcp_server fixture idiom test_agent_render_mcp_listing uses.
+ * A partially-typed "reconnect" (no trailing separator yet) and a
+ * non-matching server prefix both offer nothing. */
+static void test_agent_complete_candidates_mcp_reconnect_arg(void) {
+    char tmpl[] = "/tmp/ds4_agent_complete_mcp_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    AGENT_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    char proj[PATH_MAX], home[PATH_MAX];
+    snprintf(proj, sizeof(proj), "%s/proj", fx);
+    snprintf(home, sizeof(home), "%s/home", fx);
+
+    char ds4dir[PATH_MAX];
+    snprintf(ds4dir, sizeof(ds4dir), "%s/.ds4", proj);
+    AGENT_TEST_ASSERT(agent_mkdir_p(ds4dir));
+    AGENT_TEST_ASSERT(agent_mkdir_p(home));
+
+    char mockpath[PATH_MAX];
+    AGENT_TEST_ASSERT(realpath("tests/mock_mcp_server", mockpath) != NULL);
+
+    char mcpjson_path[PATH_MAX];
+    snprintf(mcpjson_path, sizeof(mcpjson_path), "%s/mcp.json", ds4dir);
+    FILE *fp = fopen(mcpjson_path, "wb");
+    AGENT_TEST_ASSERT(fp != NULL);
+    if (fp) {
+        fprintf(fp, "{\"mcpServers\":{\"mock\":{\"command\":\"%s\",\"args\":[\"normal\"]}}}", mockpath);
+        fclose(fp);
+    }
+
+    const char *home_save_val = getenv("HOME");
+    char *home_save = home_save_val ? xstrdup(home_save_val) : NULL;
+    setenv("HOME", home, 1);
+
+    ds4_config *cfg = ds4_config_load(proj, NULL, 0);
+    AGENT_TEST_ASSERT(cfg != NULL);
+
+    char warn[512] = {0};
+    ds4_mcp_registry *reg = cfg ? ds4_mcp_registry_create(cfg, NULL, warn, sizeof(warn)) : NULL;
+    AGENT_TEST_ASSERT(reg != NULL);
+
+    if (home_save) { setenv("HOME", home_save, 1); free(home_save); }
+    else unsetenv("HOME");
+
+    agent_complete_ctx ctx = {0};
+    ctx.mcp = reg;
+
+    char **out = NULL;
+    int n = agent_complete_candidates("/mcp reconnect ", &ctx, &out);
+    AGENT_TEST_ASSERT(n == 1);
+    if (n == 1) AGENT_TEST_ASSERT(!strcmp(out[0], "/mcp reconnect mock"));
+    for (int i = 0; i < n; i++) free(out[i]);
+    free(out);
+
+    out = NULL;
+    n = agent_complete_candidates("/mcp reconnect zzz", &ctx, &out);
+    AGENT_TEST_ASSERT(n == 0);
+    free(out);
+
+    out = NULL;
+    n = agent_complete_candidates("/mcp reco", &ctx, &out);
+    AGENT_TEST_ASSERT(n == 0);
+    free(out);
+
+    ds4_mcp_registry_free(reg);
+    ds4_config_free(cfg);
+    unlink(mcpjson_path);
+    rmdir(ds4dir);
+    rmdir(proj);
+    rmdir(home);
+    rmdir(fx);
+}
+
+/* Writes a minimal, real (parseable by ds4_kvstore_read_entry_file) session
+ * .kv file directly -- fixed header + zero-length text, no payload -- so
+ * agent_session_list_query() can enumerate it without a live ds4_engine to
+ * render/tokenize a transcript. Mirrors agent_worker_strip_session's on-disk
+ * format byte for byte. model_id is always ds4_engine_model_id(NULL)'s fixed
+ * constant, matching what agent_session_list_query() itself compares against
+ * for a NULL-engine fixture worker. */
+static void agent_test_write_fixture_session(const char *dir, const char *sha40,
+                                             uint64_t last_used) {
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/%s.kv", dir, sha40);
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return;
+    uint8_t h[DS4_KVSTORE_FIXED_HEADER];
+    ds4_kvstore_fill_header(h, (uint8_t)ds4_engine_model_id(NULL), 4,
+                            DS4_KVSTORE_REASON_AGENT_SESSION, 0,
+                            1, 0, 8192, last_used, last_used, 0);
+    uint8_t tb[4] = {0, 0, 0, 0};
+    fwrite(h, 1, sizeof(h), fp);
+    fwrite(tb, 1, sizeof(tb), fp);
+    fclose(fp);
+}
+
+/* /switch <sha-prefix> (and /del, /strip, which share the same argument
+ * completion) against a fixture kvcache dir with three real session files:
+ * two sharing prefix "14" (recency-sorted, newest first) and one that
+ * doesn't match. A non-hex prefix offers nothing. */
+static void test_agent_complete_candidates_switch_sha_prefix(void) {
+    char tmpl[] = "/tmp/ds4_agent_complete_switch_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    AGENT_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    const char *sha_older = "1400000000000000000000000000000000000000";
+    const char *sha_newer = "1411111111111111111111111111111111111111";
+    const char *sha_other = "aa00000000000000000000000000000000000000";
+    agent_test_write_fixture_session(fx, sha_older, 1000);
+    agent_test_write_fixture_session(fx, sha_newer, 2000);
+    agent_test_write_fixture_session(fx, sha_other, 3000);
+
+    agent_worker w = {0};
+    w.cache_dir = fx;
+    agent_session_list_item *sessions = NULL;
+    int sessions_len = agent_session_list_query(&w, &sessions, NULL);
+    AGENT_TEST_ASSERT(sessions_len == 3);
+
+    agent_complete_ctx ctx = {0};
+    ctx.sessions = sessions;
+    ctx.sessions_len = sessions_len;
+
+    char **out = NULL;
+    int n = agent_complete_candidates("/switch 14", &ctx, &out);
+    AGENT_TEST_ASSERT(n == 2);
+    if (n == 2) {
+        AGENT_TEST_ASSERT(!strcmp(out[0], "/switch 14111111"));
+        AGENT_TEST_ASSERT(!strcmp(out[1], "/switch 14000000"));
+    }
+    for (int i = 0; i < n; i++) free(out[i]);
+    free(out);
+
+    out = NULL;
+    n = agent_complete_candidates("/del 14", &ctx, &out);
+    AGENT_TEST_ASSERT(n == 2);
+    for (int i = 0; i < n; i++) free(out[i]);
+    free(out);
+
+    out = NULL;
+    n = agent_complete_candidates("/switch zz", &ctx, &out);
+    AGENT_TEST_ASSERT(n == 0);
+    free(out);
+
+    agent_session_list_free(sessions, sessions_len);
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/%s.kv", fx, sha_older); unlink(path);
+    snprintf(path, sizeof(path), "%s/%s.kv", fx, sha_newer); unlink(path);
+    snprintf(path, sizeof(path), "%s/%s.kv", fx, sha_other); unlink(path);
+    rmdir(fx);
+}
+
+/* agent_statusline_harness_segment: every segment present, against a real
+ * one-server MCP registry (same mock_mcp_server fixture idiom again) so
+ * agent_mcp_refresh_alive_cache() has something real to count. */
+static void test_agent_statusline_harness_segment_full(void) {
+    char tmpl[] = "/tmp/ds4_agent_statusline_mcp_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    AGENT_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    char proj[PATH_MAX], home[PATH_MAX];
+    snprintf(proj, sizeof(proj), "%s/proj", fx);
+    snprintf(home, sizeof(home), "%s/home", fx);
+    char ds4dir[PATH_MAX];
+    snprintf(ds4dir, sizeof(ds4dir), "%s/.ds4", proj);
+    AGENT_TEST_ASSERT(agent_mkdir_p(ds4dir));
+    AGENT_TEST_ASSERT(agent_mkdir_p(home));
+
+    char mockpath[PATH_MAX];
+    AGENT_TEST_ASSERT(realpath("tests/mock_mcp_server", mockpath) != NULL);
+    char mcpjson_path[PATH_MAX];
+    snprintf(mcpjson_path, sizeof(mcpjson_path), "%s/mcp.json", ds4dir);
+    FILE *fp = fopen(mcpjson_path, "wb");
+    AGENT_TEST_ASSERT(fp != NULL);
+    if (fp) {
+        fprintf(fp, "{\"mcpServers\":{\"mock\":{\"command\":\"%s\",\"args\":[\"normal\"]}}}", mockpath);
+        fclose(fp);
+    }
+
+    const char *home_save_val = getenv("HOME");
+    char *home_save = home_save_val ? xstrdup(home_save_val) : NULL;
+    setenv("HOME", home, 1);
+    ds4_config *cfg_load = ds4_config_load(proj, NULL, 0);
+    AGENT_TEST_ASSERT(cfg_load != NULL);
+    char warn[512] = {0};
+    ds4_mcp_registry *reg = cfg_load ? ds4_mcp_registry_create(cfg_load, NULL, warn, sizeof(warn)) : NULL;
+    AGENT_TEST_ASSERT(reg != NULL);
+    if (home_save) { setenv("HOME", home_save, 1); free(home_save); }
+    else unsetenv("HOME");
+
+    agent_config cfg = {0};
+    cfg.gen.think_mode = DS4_THINK_HIGH;
+    cfg.gen.ctx_size = 8192;
+
+    agent_worker w = {0};
+    w.cfg = &cfg;
+    w.mcp = reg;
+    w.skills.len = 3;
+    snprintf(w.session_sha, sizeof(w.session_sha), "14401900");
+
+    agent_mcp_refresh_alive_cache(&w);
+    AGENT_TEST_ASSERT(w.mcp_up_cached == 1);
+
+    char seg[192];
+    agent_statusline_harness_segment(&w, seg, sizeof(seg));
+    AGENT_TEST_ASSERT(!strcmp(seg, " | think high | skills 3 | mcp 1/1 | sess 14401900"));
+
+    ds4_mcp_registry_free(reg);
+    ds4_config_free(cfg_load);
+    unlink(mcpjson_path);
+    rmdir(ds4dir);
+    rmdir(proj);
+    rmdir(home);
+    rmdir(fx);
+}
+
+/* Empty states (no skills, no MCP servers, no saved session) omit those
+ * segments; think mode always shows. */
+static void test_agent_statusline_harness_segment_omissions(void) {
+    agent_config cfg = {0};
+    cfg.gen.think_mode = DS4_THINK_NONE;
+    cfg.gen.ctx_size = 8192;
+
+    agent_worker w = {0};
+    w.cfg = &cfg;
+
+    char seg[192];
+    agent_statusline_harness_segment(&w, seg, sizeof(seg));
+    AGENT_TEST_ASSERT(!strcmp(seg, " | think none"));
+}
+
+/* A small destination buffer must truncate safely (agent_progress_append's
+ * own contract): never overflow, always NUL-terminated within bounds. */
+static void test_agent_statusline_harness_segment_truncation(void) {
+    agent_config cfg = {0};
+    cfg.gen.think_mode = DS4_THINK_HIGH;
+    cfg.gen.ctx_size = 8192;
+
+    agent_worker w = {0};
+    w.cfg = &cfg;
+    w.skills.len = 5;
+    snprintf(w.session_sha, sizeof(w.session_sha), "14401900");
+
+    char buf[16];
+    memset(buf, 'X', sizeof(buf));
+    agent_statusline_harness_segment(&w, buf, 10);
+    AGENT_TEST_ASSERT(strlen(buf) < 10);
+    AGENT_TEST_ASSERT(buf[10] == 'X'); /* untouched past the given len */
+    AGENT_TEST_ASSERT(buf[15] == 'X');
+}
+
 static void ds4_agent_unit_tests_run(void) {
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
@@ -8206,6 +8714,15 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_sysprompt_cache_gc_keeps_8_most_recent();
     test_agent_sysprompt_cache_gc_keep_path_priority();
     test_agent_sysprompt_cache_gc_missing_or_empty_dir();
+    test_agent_complete_candidates_non_slash_and_empty();
+    test_agent_complete_candidates_first_word_all_and_prefix();
+    test_agent_complete_candidates_skills_arg();
+    test_agent_complete_candidates_think_modes();
+    test_agent_complete_candidates_mcp_reconnect_arg();
+    test_agent_complete_candidates_switch_sha_prefix();
+    test_agent_statusline_harness_segment_full();
+    test_agent_statusline_harness_segment_omissions();
+    test_agent_statusline_harness_segment_truncation();
 }
 #endif
 
@@ -9256,6 +9773,11 @@ static char *agent_execute_tool_call_inner(agent_worker *w, const agent_tool_cal
             free(is_string);
             char *mcp_result = ds4_mcp_registry_call_tool(w->mcp, mcp_tool, args_json);
             free(args_json);
+            /* A failed call may have just marked its server dead; refresh the
+             * statusline's cached alive count (worker thread -- see the field
+             * comment on agent_worker.mcp_up_cached for why this never races
+             * /mcp reconnect's own refresh). */
+            agent_mcp_refresh_alive_cache(w);
             return mcp_result;
         }
     }
@@ -10743,6 +11265,42 @@ static void build_status_text(const agent_status *st, char *buf, size_t len) {
     }
 }
 
+/* Appends the harness segment (think mode / skills / mcp / session) that V2
+ * adds to the footer below. Every field read here is either immutable after
+ * worker init (skills.len; effective_think_mode() is a pure function of cfg,
+ * no syscall) or updated only at the few discrete events noted on
+ * agent_worker.mcp_up_cached and session_sha's own writers (/save, /switch,
+ * and the --continue/--resume startup path, all already synchronized with
+ * the redraw path by the existing resume_settled handshake) -- never a
+ * syscall or a registry walk, so this is safe to call on every redraw.
+ * Segments are omitted when empty/irrelevant; think mode always shows.
+ * Truncation-safe via the same agent_progress_append() used by the progress
+ * bar above. */
+static void agent_statusline_harness_segment(agent_worker *w, char *buf, size_t len) {
+    if (len == 0) return;
+    buf[0] = '\0';
+    size_t pos = 0;
+    char piece[192];
+
+    ds4_think_mode mode = effective_think_mode(w->cfg);
+    snprintf(piece, sizeof(piece), " | think %s", ds4_think_mode_name(mode));
+    agent_progress_append(buf, len, &pos, piece);
+
+    if (w->skills.len > 0) {
+        snprintf(piece, sizeof(piece), " | skills %d", w->skills.len);
+        agent_progress_append(buf, len, &pos, piece);
+    }
+    int mcp_total = ds4_mcp_registry_server_count(w->mcp);
+    if (mcp_total > 0) {
+        snprintf(piece, sizeof(piece), " | mcp %d/%d", w->mcp_up_cached, mcp_total);
+        agent_progress_append(buf, len, &pos, piece);
+    }
+    if (w->session_sha[0]) {
+        snprintf(piece, sizeof(piece), " | sess %.8s", w->session_sha);
+        agent_progress_append(buf, len, &pos, piece);
+    }
+}
+
 typedef struct {
     char **v;
     size_t len;
@@ -10819,10 +11377,15 @@ static bool agent_footer_is_multiline(const char *status) {
 
 /* Build the editable footer.  With queued prompts, the footer becomes multiple
  * rows: a compact queue preview first, then the normal status row. */
-static void build_footer_text(const agent_status *st, const agent_prompt_queue *queue,
+static void build_footer_text(agent_worker *w, const agent_status *st,
+                              const agent_prompt_queue *queue,
                               int cols, char *buf, size_t len) {
     char status[512];
     build_status_text(st, status, sizeof(status));
+    size_t status_len = strlen(status);
+    char harness[192];
+    agent_statusline_harness_segment(w, harness, sizeof(harness));
+    agent_progress_append(status, sizeof(status), &status_len, harness);
     if (!queue || !queue->len) {
         snprintf(buf, len, "%s", status);
         return;
@@ -12042,6 +12605,19 @@ static char *agent_render_hooks(agent_worker *w, const char *arg) {
     return agent_input_buf_take(&buf);
 }
 
+/* Recomputes w->mcp_up_cached from the registry: see the field's own comment
+ * on agent_worker for who calls this and why the redraw path never does.
+ * Bounded by the configured server count (typically a handful), so this loop
+ * is only ever acceptable at the infrequent events that actually call it. */
+static void agent_mcp_refresh_alive_cache(agent_worker *w) {
+    int total = ds4_mcp_registry_server_count(w->mcp);
+    int up = 0;
+    for (int i = 0; i < total; i++) {
+        if (ds4_mcp_registry_server_alive(w->mcp, i)) up++;
+    }
+    w->mcp_up_cached = up;
+}
+
 /* Truncates desc to its first line, capped at ~80 bytes for a readable
  * listing line, without splitting a UTF-8 sequence (mirrors ds4_mcp's own
  * mcp_sanitize_desc truncation logic -- descriptions are already control-char/
@@ -12205,6 +12781,7 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
     ds4_skills_scan(w->config, &w->skills, skills_warn, sizeof(skills_warn));
     char mcp_warn[512] = {0};
     w->mcp = ds4_mcp_registry_create(w->config, NULL, mcp_warn, sizeof(mcp_warn));
+    agent_mcp_refresh_alive_cache(w);
     char hooks_warn[512] = {0};
     w->hooks = ds4_hooks_load(w->config, hooks_warn, sizeof(hooks_warn));
     char perms_warn[512] = {0};
@@ -12624,14 +13201,14 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
     linenoiseHistorySetMaxLen(512);
     linenoiseHistoryLoad(hist);
     agent_completion_worker = &worker;
-    linenoiseSetCompletionCallback(agent_switch_completion_callback);
+    linenoiseSetCompletionCallback(agent_completion_callback);
 
     agent_status st;
     worker_get_status(&worker, &st);
     char prompt[160];
     char statusline[4096];
     build_prompt_text(&st, prompt, sizeof(prompt));
-    build_footer_text(&st, NULL, 80, statusline, sizeof(statusline));
+    build_footer_text(&worker, &st, NULL, 80, statusline, sizeof(statusline));
 
     /* Only with --continue/--resume: block until the worker's startup resume
      * attempt has fully resolved before editor_start()/the welcome banner
@@ -12705,7 +13282,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
         worker_consume(&worker, &out, &out_len, &st);
         build_prompt_text(&st, prompt, sizeof(prompt));
         int footer_cols = editor.edit.cols > 0 ? (int)editor.edit.cols : 80;
-        build_footer_text(&st, &queue, footer_cols, statusline, sizeof(statusline));
+        build_footer_text(&worker, &st, &queue, footer_cols, statusline, sizeof(statusline));
         if (out && out_len) {
             bool force_show = st.state == AGENT_WORKER_IDLE ||
                               st.state == AGENT_WORKER_ERROR ||
@@ -12736,7 +13313,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
             char *echo = agent_prompt_queue_take_all_echo(&queue);
             char *queued = agent_prompt_queue_take_all(&queue);
             if (echo) {
-                build_footer_text(&st, &queue, footer_cols, statusline, sizeof(statusline));
+                build_footer_text(&worker, &st, &queue, footer_cols, statusline, sizeof(statusline));
                 editor_write_async(&editor, echo, strlen(echo), prompt, statusline, true);
                 free(echo);
             }
@@ -12766,7 +13343,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
             worker_get_status(&worker, &st);
             build_prompt_text(&st, prompt, sizeof(prompt));
             int restart_cols = editor.edit.cols > 0 ? (int)editor.edit.cols : 80;
-            build_footer_text(&st, &queue, restart_cols, statusline, sizeof(statusline));
+            build_footer_text(&worker, &st, &queue, restart_cols, statusline, sizeof(statusline));
             editor_start(&editor, prompt, statusline, saved_input);
             free(saved_input);
             continue;
@@ -12786,7 +13363,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
             worker_get_status(&worker, &st);
             build_prompt_text(&st, prompt, sizeof(prompt));
             int restart_cols = editor.edit.cols > 0 ? (int)editor.edit.cols : 80;
-            build_footer_text(&st, &queue, restart_cols, statusline, sizeof(statusline));
+            build_footer_text(&worker, &st, &queue, restart_cols, statusline, sizeof(statusline));
             editor_start(&editor, prompt, statusline, saved_input);
             free(saved_input);
             continue;
@@ -12805,7 +13382,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
             if (worker_submit(&worker, queued)) {
                 linenoiseHistoryAdd(queued);
                 linenoiseHistorySave(hist);
-                build_footer_text(&st, &queue, footer_cols, statusline, sizeof(statusline));
+                build_footer_text(&worker, &st, &queue, footer_cols, statusline, sizeof(statusline));
                 if (echo)
                     editor_write_async(&editor, echo, strlen(echo), prompt, statusline, true);
             } else {
@@ -12822,7 +13399,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
             worker_get_status(&worker, &st);
             build_prompt_text(&st, prompt, sizeof(prompt));
             footer_cols = editor.edit.cols > 0 ? (int)editor.edit.cols : 80;
-            build_footer_text(&st, &queue, footer_cols, statusline, sizeof(statusline));
+            build_footer_text(&worker, &st, &queue, footer_cols, statusline, sizeof(statusline));
             editor_set_prompt_status(&editor, prompt, statusline);
             free(queued);
         }
@@ -13070,7 +13647,13 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                             while (*end && *end != ' ' && *end != '\t') end++;
                             if (*end) *end = '\0';
                             char err[256] = {0};
-                            if (ds4_mcp_registry_reconnect(worker.mcp, name, err, sizeof(err)))
+                            bool reconnected =
+                                ds4_mcp_registry_reconnect(worker.mcp, name, err, sizeof(err));
+                            /* Refresh the statusline's cached alive count
+                             * either way: a failed reconnect can still leave
+                             * the server dead when it was previously alive. */
+                            agent_mcp_refresh_alive_cache(&worker);
+                            if (reconnected)
                                 printf("reconnected %s (tool list retained; restart session to refresh tools)\n",
                                        name);
                             else
@@ -13167,7 +13750,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                     worker_get_status(&worker, &st);
                     build_prompt_text(&st, prompt, sizeof(prompt));
                     int restart_cols = editor.edit.cols > 0 ? (int)editor.edit.cols : 80;
-                    build_footer_text(&st, &queue, restart_cols, statusline, sizeof(statusline));
+                    build_footer_text(&worker, &st, &queue, restart_cols, statusline, sizeof(statusline));
                     editor_start(&editor, prompt, statusline, restore_line);
                     if (!editor.scroll_region && was_below_output) {
                         editor.output_line_open = had_output_line_open;
