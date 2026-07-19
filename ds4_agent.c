@@ -101,6 +101,12 @@ typedef struct {
     int ctx_size;
     int power_percent;
     char error[256];
+    /* Snapshot of agent_worker.session_sha, refreshed under w->mu alongside
+     * ctx_used/power_percent below -- session_sha itself is written from
+     * both the UI and worker threads (session create/save/switch/reset), so
+     * agent_statusline_harness_segment() must read it from here, never
+     * directly off the live worker, to avoid a torn read of the buffer. */
+    char session_sha[41];
 } agent_status;
 
 typedef struct agent_bash_job agent_bash_job;
@@ -3994,7 +4000,13 @@ static void agent_session_identity_sha(const char *title, uint64_t created_at,
 }
 
 static void agent_worker_clear_session_identity(agent_worker *w) {
+    /* Called from both the UI thread (/new) and the worker thread (automatic
+     * reset-to-sysprompt on compaction), so this write to the buffer the
+     * statusline snapshots (see agent_status.session_sha) needs the lock;
+     * everything else this function touches isn't read cross-thread. */
+    pthread_mutex_lock(&w->mu);
     w->session_sha[0] = '\0';
+    pthread_mutex_unlock(&w->mu);
     free(w->session_title);
     w->session_title = NULL;
     w->session_created_at = 0;
@@ -4868,7 +4880,6 @@ static bool agent_worker_save_session_now(agent_worker *w, char sha_out[41],
                                  w->session_title, w->session_created_at,
                                  err, err_len);
     if (ok) {
-        memcpy(w->session_sha, sha, sizeof(w->session_sha));
         if (w->legacy_session_path_to_delete &&
             strcmp(w->legacy_session_path_to_delete, path) != 0)
         {
@@ -4876,7 +4887,12 @@ static bool agent_worker_save_session_now(agent_worker *w, char sha_out[41],
         }
         free(w->legacy_session_path_to_delete);
         w->legacy_session_path_to_delete = NULL;
+        /* Called from both the UI thread (/save) and the worker thread
+         * (worker_run_deferred_save), so this write to the buffer the
+         * statusline snapshots needs the lock; reuses the critical section
+         * session_dirty/agent_wake_locked already take just below. */
         pthread_mutex_lock(&w->mu);
+        memcpy(w->session_sha, sha, sizeof(w->session_sha));
         w->session_dirty = false;
         agent_wake_locked(w);
         pthread_mutex_unlock(&w->mu);
@@ -6020,12 +6036,16 @@ static bool agent_worker_switch_session(agent_worker *w, const char *prefix,
         free(w->session_title);
         w->session_title = meta.title ? xstrdup(meta.title) : xstrdup("(no user prompt)");
         w->session_created_at = meta.created_at ? meta.created_at : (uint64_t)time(NULL);
-        memcpy(w->session_sha, sha, sizeof(w->session_sha));
         free(w->legacy_session_path_to_delete);
         w->legacy_session_path_to_delete = meta.legacy_identity ? xstrdup(path) : NULL;
         agent_worker_note_system_prompt_seen(w);
         w->datetime_context_injected = true;
+        /* Called from both the UI thread (/switch) and the worker thread
+         * (--continue/--resume startup), so this write to the buffer the
+         * statusline snapshots needs the lock; reuses the critical section
+         * already taken just below for status/session_dirty. */
         pthread_mutex_lock(&w->mu);
+        memcpy(w->session_sha, sha, sizeof(w->session_sha));
         w->user_activity = true;
         w->session_dirty = false;
         w->status.state = AGENT_WORKER_IDLE;
@@ -6841,7 +6861,8 @@ static char *agent_render_hooks(agent_worker *w, const char *arg);
 /* agent_think_mode_apply is NOT forward declared here: it's pure config
  * logic defined right next to effective_think_mode, well above this test
  * block, so it's already visible by this point. */
-static void agent_statusline_harness_segment(agent_worker *w, char *buf, size_t len);
+static void agent_statusline_harness_segment(agent_worker *w, const agent_status *st,
+                                             char *buf, size_t len);
 
 static void test_agent_tool_skill_dispatch(void) {
     char tmpl[] = "/tmp/ds4_agent_skill_dispatch_test.XXXXXX";
@@ -8329,12 +8350,17 @@ static void test_agent_sysprompt_cache_gc_missing_or_empty_dir(void) {
 }
 
 /* agent_complete_candidates: a line that isn't a slash command (empty or
- * otherwise) offers nothing, regardless of ctx. */
+ * otherwise) offers nothing, regardless of ctx; neither does a complete-but-
+ * unknown command's argument position (a command with no arg-completion
+ * branch at all, unlike the tested "unknown server/skill/sha" cases within
+ * a known command's own branch). */
 static void test_agent_complete_candidates_non_slash_and_empty(void) {
     char **out = NULL;
     AGENT_TEST_ASSERT(agent_complete_candidates("", NULL, &out) == 0);
     AGENT_TEST_ASSERT(out == NULL);
     AGENT_TEST_ASSERT(agent_complete_candidates("hello", NULL, &out) == 0);
+    AGENT_TEST_ASSERT(out == NULL);
+    AGENT_TEST_ASSERT(agent_complete_candidates("/xyz foo", NULL, &out) == 0);
     AGENT_TEST_ASSERT(out == NULL);
 }
 
@@ -8631,13 +8657,17 @@ static void test_agent_statusline_harness_segment_full(void) {
     w.cfg = &cfg;
     w.mcp = reg;
     w.skills.len = 3;
-    snprintf(w.session_sha, sizeof(w.session_sha), "14401900");
 
     agent_mcp_refresh_alive_cache(&w);
     AGENT_TEST_ASSERT(w.mcp_up_cached == 1);
 
+    /* session_sha is read from the agent_status snapshot, not off the live
+     * worker -- see agent_statusline_harness_segment's own comment. */
+    agent_status st = {0};
+    snprintf(st.session_sha, sizeof(st.session_sha), "14401900");
+
     char seg[192];
-    agent_statusline_harness_segment(&w, seg, sizeof(seg));
+    agent_statusline_harness_segment(&w, &st, seg, sizeof(seg));
     AGENT_TEST_ASSERT(!strcmp(seg, " | think high | skills 3 | mcp 1/1 | sess 14401900"));
 
     ds4_mcp_registry_free(reg);
@@ -8658,9 +8688,10 @@ static void test_agent_statusline_harness_segment_omissions(void) {
 
     agent_worker w = {0};
     w.cfg = &cfg;
+    agent_status st = {0};
 
     char seg[192];
-    agent_statusline_harness_segment(&w, seg, sizeof(seg));
+    agent_statusline_harness_segment(&w, &st, seg, sizeof(seg));
     AGENT_TEST_ASSERT(!strcmp(seg, " | think none"));
 }
 
@@ -8674,11 +8705,12 @@ static void test_agent_statusline_harness_segment_truncation(void) {
     agent_worker w = {0};
     w.cfg = &cfg;
     w.skills.len = 5;
-    snprintf(w.session_sha, sizeof(w.session_sha), "14401900");
+    agent_status st = {0};
+    snprintf(st.session_sha, sizeof(st.session_sha), "14401900");
 
     char buf[16];
     memset(buf, 'X', sizeof(buf));
-    agent_statusline_harness_segment(&w, buf, 10);
+    agent_statusline_harness_segment(&w, &st, buf, 10);
     AGENT_TEST_ASSERT(strlen(buf) < 10);
     AGENT_TEST_ASSERT(buf[10] == 'X'); /* untouched past the given len */
     AGENT_TEST_ASSERT(buf[15] == 'X');
@@ -10410,8 +10442,15 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
     if (!w->session_title) {
         w->session_title = agent_session_title_from_prompt(user_text, 0);
         w->session_created_at = (uint64_t)time(NULL);
-        agent_session_identity_sha(w->session_title, w->session_created_at,
-                                   w->session_sha);
+        char sha[41];
+        agent_session_identity_sha(w->session_title, w->session_created_at, sha);
+        /* Runs on the worker thread; the UI thread's redraw path reads this
+         * buffer via the agent_status snapshot (see agent_status.session_sha),
+         * so the write needs the lock -- a new, small critical section, once
+         * per session (first turn only), not on the hot per-token path. */
+        pthread_mutex_lock(&w->mu);
+        memcpy(w->session_sha, sha, sizeof(w->session_sha));
+        pthread_mutex_unlock(&w->mu);
     }
     ds4_chat_append_message(w->engine, &w->transcript, "user", user_text);
 
@@ -11041,6 +11080,7 @@ static void worker_consume(agent_worker *w, char **out, size_t *out_len, agent_s
     w->status.ctx_used = w->transcript.len;
     w->status.ctx_size = w->cfg->gen.ctx_size;
     w->status.power_percent = worker_status_power_locked(w);
+    memcpy(w->status.session_sha, w->session_sha, sizeof(w->status.session_sha));
     if (status) *status = w->status;
     w->wake_pending = false;
     pthread_mutex_unlock(&w->mu);
@@ -11051,6 +11091,7 @@ static void worker_get_status(agent_worker *w, agent_status *status) {
     w->status.ctx_used = w->transcript.len;
     w->status.ctx_size = w->cfg->gen.ctx_size;
     w->status.power_percent = worker_status_power_locked(w);
+    memcpy(w->status.session_sha, w->session_sha, sizeof(w->status.session_sha));
     *status = w->status;
     pthread_mutex_unlock(&w->mu);
 }
@@ -11069,6 +11110,7 @@ static bool worker_is_initialized(agent_worker *w, agent_status *status) {
     w->status.ctx_used = w->transcript.len;
     w->status.ctx_size = w->cfg->gen.ctx_size;
     w->status.power_percent = worker_status_power_locked(w);
+    memcpy(w->status.session_sha, w->session_sha, sizeof(w->status.session_sha));
     if (status) *status = w->status;
     bool initialized = w->initialized;
     pthread_mutex_unlock(&w->mu);
@@ -11266,17 +11308,20 @@ static void build_status_text(const agent_status *st, char *buf, size_t len) {
 }
 
 /* Appends the harness segment (think mode / skills / mcp / session) that V2
- * adds to the footer below. Every field read here is either immutable after
- * worker init (skills.len; effective_think_mode() is a pure function of cfg,
- * no syscall) or updated only at the few discrete events noted on
- * agent_worker.mcp_up_cached and session_sha's own writers (/save, /switch,
- * and the --continue/--resume startup path, all already synchronized with
- * the redraw path by the existing resume_settled handshake) -- never a
- * syscall or a registry walk, so this is safe to call on every redraw.
+ * adds to the footer below. skills.len is immutable after worker init;
+ * effective_think_mode() is a pure function of cfg, no syscall;
+ * mcp_up_cached/mcp_total are the cache and free O(1) accessor documented on
+ * agent_worker -- none of those need synchronization to read here. Session
+ * sha is the one exception: agent_worker.session_sha is written from both
+ * the UI and worker threads (session create/save/switch/reset), so it is
+ * read from st->session_sha (a snapshot taken under w->mu alongside
+ * ctx_used/power_percent -- see worker_get_status et al.), never directly
+ * off the live worker, to avoid a torn read of that 41-byte buffer.
  * Segments are omitted when empty/irrelevant; think mode always shows.
  * Truncation-safe via the same agent_progress_append() used by the progress
  * bar above. */
-static void agent_statusline_harness_segment(agent_worker *w, char *buf, size_t len) {
+static void agent_statusline_harness_segment(agent_worker *w, const agent_status *st,
+                                             char *buf, size_t len) {
     if (len == 0) return;
     buf[0] = '\0';
     size_t pos = 0;
@@ -11295,8 +11340,8 @@ static void agent_statusline_harness_segment(agent_worker *w, char *buf, size_t 
         snprintf(piece, sizeof(piece), " | mcp %d/%d", w->mcp_up_cached, mcp_total);
         agent_progress_append(buf, len, &pos, piece);
     }
-    if (w->session_sha[0]) {
-        snprintf(piece, sizeof(piece), " | sess %.8s", w->session_sha);
+    if (st->session_sha[0]) {
+        snprintf(piece, sizeof(piece), " | sess %.8s", st->session_sha);
         agent_progress_append(buf, len, &pos, piece);
     }
 }
@@ -11384,7 +11429,7 @@ static void build_footer_text(agent_worker *w, const agent_status *st,
     build_status_text(st, status, sizeof(status));
     size_t status_len = strlen(status);
     char harness[192];
-    agent_statusline_harness_segment(w, harness, sizeof(harness));
+    agent_statusline_harness_segment(w, st, harness, sizeof(harness));
     agent_progress_append(status, sizeof(status), &status_len, harness);
     if (!queue || !queue->len) {
         snprintf(buf, len, "%s", status);
