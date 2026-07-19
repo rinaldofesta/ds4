@@ -101,6 +101,13 @@ typedef struct {
     int ctx_size;
     int power_percent;
     char error[256];
+    /* Snapshot of agent_worker.mcp_up_cached, refreshed under w->mu alongside
+     * ctx_used/power_percent below -- mcp_up_cached itself is written from
+     * both the UI thread (worker init, /mcp reconnect) and the worker thread
+     * (after an MCP tool call completes), so agent_statusline_harness_segment()
+     * must read it from here, never directly off the live worker, to avoid a
+     * cross-thread read racing the writer's store. */
+    int mcp_up_cached;
     /* Snapshot of agent_worker.session_sha, refreshed under w->mu alongside
      * ctx_used/power_percent below -- session_sha itself is written from
      * both the UI and worker threads (session create/save/switch/reset), so
@@ -128,7 +135,11 @@ typedef struct {
      * reconnect (both on the UI thread), and after an MCP tool call
      * completes (worker thread) -- the last of those can only ever run while
      * the UI thread's busy-gate keeps /mcp reconnect from running, so the two
-     * threads are never writing it at the same time. */
+     * threads are never writing it at the same time. The redraw path can
+     * still run concurrently with that worker-thread write, though, so the
+     * store takes w->mu and the statusline reads the agent_status.mcp_up_cached
+     * snapshot (refreshed under w->mu alongside ctx_used/power_percent), never
+     * this field directly -- same treatment as session_sha below. */
     int mcp_up_cached;
     ds4_hooks *hooks;
     ds4_permissions *perms;
@@ -8657,13 +8668,19 @@ static void test_agent_statusline_harness_segment_full(void) {
     w.cfg = &cfg;
     w.mcp = reg;
     w.skills.len = 3;
+    /* agent_mcp_refresh_alive_cache() now takes w->mu around its store (see
+     * its own comment), so this stack worker needs a real mutex rather than
+     * the zeroed one {0} leaves behind. */
+    pthread_mutex_init(&w.mu, NULL);
 
     agent_mcp_refresh_alive_cache(&w);
     AGENT_TEST_ASSERT(w.mcp_up_cached == 1);
 
-    /* session_sha is read from the agent_status snapshot, not off the live
-     * worker -- see agent_statusline_harness_segment's own comment. */
+    /* mcp_up_cached and session_sha are both read from the agent_status
+     * snapshot, never off the live worker -- see
+     * agent_statusline_harness_segment's own comment. */
     agent_status st = {0};
+    st.mcp_up_cached = w.mcp_up_cached;
     snprintf(st.session_sha, sizeof(st.session_sha), "14401900");
 
     char seg[192];
@@ -11080,6 +11097,7 @@ static void worker_consume(agent_worker *w, char **out, size_t *out_len, agent_s
     w->status.ctx_used = w->transcript.len;
     w->status.ctx_size = w->cfg->gen.ctx_size;
     w->status.power_percent = worker_status_power_locked(w);
+    w->status.mcp_up_cached = w->mcp_up_cached;
     memcpy(w->status.session_sha, w->session_sha, sizeof(w->status.session_sha));
     if (status) *status = w->status;
     w->wake_pending = false;
@@ -11091,6 +11109,7 @@ static void worker_get_status(agent_worker *w, agent_status *status) {
     w->status.ctx_used = w->transcript.len;
     w->status.ctx_size = w->cfg->gen.ctx_size;
     w->status.power_percent = worker_status_power_locked(w);
+    w->status.mcp_up_cached = w->mcp_up_cached;
     memcpy(w->status.session_sha, w->session_sha, sizeof(w->status.session_sha));
     *status = w->status;
     pthread_mutex_unlock(&w->mu);
@@ -11110,6 +11129,7 @@ static bool worker_is_initialized(agent_worker *w, agent_status *status) {
     w->status.ctx_used = w->transcript.len;
     w->status.ctx_size = w->cfg->gen.ctx_size;
     w->status.power_percent = worker_status_power_locked(w);
+    w->status.mcp_up_cached = w->mcp_up_cached;
     memcpy(w->status.session_sha, w->session_sha, sizeof(w->status.session_sha));
     if (status) *status = w->status;
     bool initialized = w->initialized;
@@ -11309,14 +11329,15 @@ static void build_status_text(const agent_status *st, char *buf, size_t len) {
 
 /* Appends the harness segment (think mode / skills / mcp / session) that V2
  * adds to the footer below. skills.len is immutable after worker init;
- * effective_think_mode() is a pure function of cfg, no syscall;
- * mcp_up_cached/mcp_total are the cache and free O(1) accessor documented on
- * agent_worker -- none of those need synchronization to read here. Session
- * sha is the one exception: agent_worker.session_sha is written from both
- * the UI and worker threads (session create/save/switch/reset), so it is
- * read from st->session_sha (a snapshot taken under w->mu alongside
- * ctx_used/power_percent -- see worker_get_status et al.), never directly
- * off the live worker, to avoid a torn read of that 41-byte buffer.
+ * effective_think_mode() is a pure function of cfg, no syscall; mcp_total is
+ * the free O(1) registry accessor documented on agent_worker, safe to read
+ * directly. mcp_up_cached and session_sha are the two exceptions: both are
+ * written from both the UI thread (worker init, /mcp reconnect, session
+ * create/save/switch/reset) and the worker thread (after an MCP tool call;
+ * session create/save/switch/reset), so both are read from the st snapshot
+ * (taken under w->mu alongside ctx_used/power_percent -- see
+ * worker_get_status et al.), never directly off the live worker, to avoid a
+ * cross-thread race on either field.
  * Segments are omitted when empty/irrelevant; think mode always shows.
  * Truncation-safe via the same agent_progress_append() used by the progress
  * bar above. */
@@ -11337,7 +11358,7 @@ static void agent_statusline_harness_segment(agent_worker *w, const agent_status
     }
     int mcp_total = ds4_mcp_registry_server_count(w->mcp);
     if (mcp_total > 0) {
-        snprintf(piece, sizeof(piece), " | mcp %d/%d", w->mcp_up_cached, mcp_total);
+        snprintf(piece, sizeof(piece), " | mcp %d/%d", st->mcp_up_cached, mcp_total);
         agent_progress_append(buf, len, &pos, piece);
     }
     if (st->session_sha[0]) {
@@ -12324,8 +12345,9 @@ static char *agent_render_skills(agent_worker *w, const char *arg) {
     if (arg && arg[0]) {
         char *body = ds4_skills_load_body(&w->skills, arg);
         if (body) return body;
-        char *msg = xmalloc(strlen(arg) + 32);
-        sprintf(msg, "No such skill: %s\n", arg);
+        size_t msg_len = strlen(arg) + 32;
+        char *msg = xmalloc(msg_len);
+        snprintf(msg, msg_len, "No such skill: %s\n", arg);
         return msg;
     }
 
@@ -12653,14 +12675,22 @@ static char *agent_render_hooks(agent_worker *w, const char *arg) {
 /* Recomputes w->mcp_up_cached from the registry: see the field's own comment
  * on agent_worker for who calls this and why the redraw path never does.
  * Bounded by the configured server count (typically a handful), so this loop
- * is only ever acceptable at the infrequent events that actually call it. */
+ * is only ever acceptable at the infrequent events that actually call it.
+ * The store below takes w->mu -- called from both the UI thread (worker
+ * init, /mcp reconnect) and the worker thread (after an MCP tool call), and
+ * the redraw path reads the field via the agent_status.mcp_up_cached
+ * snapshot taken under the same lock, never this field directly, so the two
+ * sides never race. Once per MCP tool call at most, not the hot per-token
+ * path. */
 static void agent_mcp_refresh_alive_cache(agent_worker *w) {
     int total = ds4_mcp_registry_server_count(w->mcp);
     int up = 0;
     for (int i = 0; i < total; i++) {
         if (ds4_mcp_registry_server_alive(w->mcp, i)) up++;
     }
+    pthread_mutex_lock(&w->mu);
     w->mcp_up_cached = up;
+    pthread_mutex_unlock(&w->mu);
 }
 
 /* Truncates desc to its first line, capped at ~80 bytes for a readable

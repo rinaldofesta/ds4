@@ -1221,6 +1221,11 @@ bool ds4_mcp_registry_reconnect(ds4_mcp_registry *reg, const char *server_name,
          * alive or not -- terminate and reap it explicitly rather than
          * relying on a deeper layer having already done so. */
         mcp_terminate_proc(p);
+        /* mcp_terminate_proc only reaps the process; the fds mcp_spawn_proc
+         * just opened for it are meaningless once that process is gone, same
+         * as the reset-before-respawn close above. */
+        if (p->fd_in >= 0) { close(p->fd_in); p->fd_in = -1; }
+        if (p->fd_out >= 0) { close(p->fd_out); p->fd_out = -1; }
         return false;
     }
 
