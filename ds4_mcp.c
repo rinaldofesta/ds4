@@ -196,6 +196,32 @@ static void mcp_cfgentry_list_free(mcp_cfgentry_list *list) {
     free(list->v);
 }
 
+/* Deep-copies a cfgentry so a mcp_proc can retain its own spawn spec beyond
+ * mcp_cfgentry_list_free (registry_create frees the parsed config list right
+ * after spawning every configured server) -- ds4_mcp_registry_reconnect needs
+ * the exact original command/args/env to respawn from later in the session,
+ * so every proc gets one of these at push time regardless of whether its
+ * initial spawn succeeds (see ds4_mcp_registry_create). Freed alongside the
+ * rest of the proc in ds4_mcp_registry_free via mcp_cfgentry_free_one. */
+static void mcp_cfgentry_dup_into(mcp_cfgentry *out, const mcp_cfgentry *src) {
+    memset(out, 0, sizeof(*out));
+    out->name = mcp_strdup(src->name);
+    int argc = 0;
+    while (src->argv && src->argv[argc]) argc++;
+    out->argv = malloc((size_t)(argc + 1) * sizeof(char *));
+    for (int i = 0; i < argc; i++) out->argv[i] = mcp_strdup(src->argv[i]);
+    out->argv[argc] = NULL;
+    out->envc = src->envc;
+    if (out->envc > 0) {
+        out->env_keys = malloc((size_t)out->envc * sizeof(char *));
+        out->env_vals = malloc((size_t)out->envc * sizeof(char *));
+        for (int i = 0; i < out->envc; i++) {
+            out->env_keys[i] = mcp_strdup(src->env_keys[i]);
+            out->env_vals[i] = mcp_strdup(src->env_vals[i]);
+        }
+    }
+}
+
 /* Validates and materializes one "name": {...} entry from mcpServers. Fully
  * fail-open: any shape violation warns and skips just this entry. */
 static bool mcp_parse_server_entry(const char *name, const ds4_json_value *val, mcp_cfgentry *out,
@@ -353,6 +379,7 @@ typedef struct {
     char *rbuf;
     size_t rbuf_len, rbuf_cap;
     int malformed_count;
+    mcp_cfgentry spawn_cfg; /* retained verbatim for ds4_mcp_registry_reconnect */
 } mcp_proc;
 
 struct ds4_mcp_registry {
@@ -593,8 +620,13 @@ static char *mcp_build_notification(const char *method) {
  * shutdown), dup2's the pipes onto stdin/stdout, stderr -> /dev/null,
  * applies env via setenv, then execvp (no shell). Parent keeps the other
  * ends, CLOEXEC'd. Always leaves a proc entry behind (even on failure) so
- * ds4_mcp_registry_free has something consistent to iterate. */
-static bool mcp_spawn(mcp_proc *proc, const mcp_cfgentry *cfg, char *warn, size_t warn_len) {
+ * ds4_mcp_registry_free has something consistent to iterate.
+ *
+ * Reused verbatim (no functional change from its original single call site in
+ * ds4_mcp_registry_create) by ds4_mcp_registry_reconnect to respawn a single
+ * server from its retained spawn spec -- hence the _proc-suffixed name,
+ * distinguishing "spawn one process" from the registry-level operation. */
+static bool mcp_spawn_proc(mcp_proc *proc, const mcp_cfgentry *cfg, char *warn, size_t warn_len) {
     int p_in[2], p_out[2];
     if (pipe(p_in) != 0) {
         mcp_warn_append(warn, warn_len, cfg->name, "failed to create stdin pipe, skipped");
@@ -709,11 +741,15 @@ static const char MCP_INIT_PARAMS[] =
     "{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},"
     "\"clientInfo\":{\"name\":\"ds4-agent\",\"version\":\"0.1\"}}";
 
-/* Handshake (initialize -> notifications/initialized) then tools/list
- * pagination (max 16 pages). Any failure at any step warns and returns,
- * leaving the proc in the registry (for teardown reaping) and whatever
- * tools had already been collected (possibly zero). */
-static void mcp_discover_one(ds4_mcp_registry *reg, mcp_proc *p, const char *server_name,
+/* initialize -> notifications/initialized handshake, factored out of
+ * mcp_discover_one (pure code motion, no behavior change at the original
+ * call site) so ds4_mcp_registry_reconnect can redo just the handshake
+ * against a freshly respawned proc without re-fetching tools/list -- the
+ * existing tool table is kept verbatim across a reconnect (see
+ * ds4_mcp_registry_reconnect's doc comment in ds4_mcp.h). Any failure warns
+ * and returns false; the proc is left in the registry either way (for
+ * teardown reaping / a later reconnect attempt). */
+static bool mcp_do_handshake(ds4_mcp_registry *reg, mcp_proc *p, const char *server_name,
                              char *warn, size_t warn_len) {
     int hs_ms = reg->opts.handshake_timeout_ms;
 
@@ -723,24 +759,24 @@ static void mcp_discover_one(ds4_mcp_registry *reg, mcp_proc *p, const char *ser
     free(req);
     if (!sent) {
         mcp_warn_append(warn, warn_len, server_name, "failed to send initialize, skipped");
-        return;
+        return false;
     }
 
     ds4_json_value *doc = NULL;
     mcp_resp_status st = mcp_await_response(p, init_id, hs_ms, &doc);
     if (st == MCP_RESP_TIMEOUT) {
         mcp_warn_append(warn, warn_len, server_name, "initialize timed out, skipped");
-        return;
+        return false;
     }
     if (st == MCP_RESP_DEAD) {
         mcp_warn_append(warn, warn_len, server_name, "died during handshake, skipped");
-        return;
+        return false;
     }
     bool has_error = ds4_json_obj_get(doc, "error") != NULL;
     ds4_json_free(doc);
     if (has_error) {
         mcp_warn_append(warn, warn_len, server_name, "initialize returned an error, skipped");
-        return;
+        return false;
     }
 
     char *note = mcp_build_notification("notifications/initialized");
@@ -748,8 +784,19 @@ static void mcp_discover_one(ds4_mcp_registry *reg, mcp_proc *p, const char *ser
     free(note);
     if (!sent) {
         mcp_warn_append(warn, warn_len, server_name, "failed to send notifications/initialized, skipped");
-        return;
+        return false;
     }
+    return true;
+}
+
+/* Handshake (via mcp_do_handshake) then tools/list pagination (max 16 pages).
+ * Any failure at any step warns and returns, leaving the proc in the
+ * registry (for teardown reaping) and whatever tools had already been
+ * collected (possibly zero). */
+static void mcp_discover_one(ds4_mcp_registry *reg, mcp_proc *p, const char *server_name,
+                             char *warn, size_t warn_len) {
+    int hs_ms = reg->opts.handshake_timeout_ms;
+    if (!mcp_do_handshake(reg, p, server_name, warn, warn_len)) return;
 
     char *cursor = NULL;
     for (int page = 0; page < DS4_MCP_MAX_PAGES; page++) {
@@ -766,7 +813,7 @@ static void mcp_discover_one(ds4_mcp_registry *reg, mcp_proc *p, const char *ser
         }
         char *lreq = mcp_build_request(list_id, "tools/list", params);
         free(params);
-        sent = mcp_send_line(p, lreq);
+        bool sent = mcp_send_line(p, lreq);
         free(lreq);
         if (!sent) {
             mcp_warn_append(warn, warn_len, server_name, "failed to send tools/list, skipped remaining pages");
@@ -850,7 +897,12 @@ ds4_mcp_registry *ds4_mcp_registry_create(const ds4_config *cfg, const ds4_mcp_o
     for (int i = 0; i < configs.len; i++) {
         mcp_cfgentry *ce = &configs.v[i];
         mcp_proc *p = mcp_proc_push(reg, ce->name);
-        if (!mcp_spawn(p, ce, warn, warn_len)) continue; /* proc stays (pid=-1); harmless in free */
+        /* Retained regardless of spawn outcome: a server that fails to spawn
+         * now might still be reconnectable later (e.g. a transient resource
+         * error), and ds4_mcp_registry_reconnect has no other source for the
+         * original command/args/env once mcp_cfgentry_list_free below runs. */
+        mcp_cfgentry_dup_into(&p->spawn_cfg, ce);
+        if (!mcp_spawn_proc(p, ce, warn, warn_len)) continue; /* proc stays (pid=-1); harmless in free */
         mcp_discover_one(reg, p, ce->name, warn, warn_len);
     }
 
@@ -864,7 +916,7 @@ ds4_mcp_registry *ds4_mcp_registry_create(const ds4_config *cfg, const ds4_mcp_o
 void ds4_mcp_registry_free(ds4_mcp_registry *reg) {
     if (!reg) return;
 
-    /* Negative pid = "the whole process group" (see mcp_spawn's setpgid
+    /* Negative pid = "the whole process group" (see mcp_spawn_proc's setpgid
      * pair), so a wrapper like npx/uvx and whatever real server process it
      * execs/forks are signaled together -- killing just the wrapper's bare
      * pid would leave the actual server running as an orphaned grandchild. */
@@ -900,6 +952,7 @@ void ds4_mcp_registry_free(ds4_mcp_registry *reg) {
         free(p->rbuf);
         if (p->fd_in >= 0) close(p->fd_in);
         if (p->fd_out >= 0) close(p->fd_out);
+        mcp_cfgentry_free_one(&p->spawn_cfg);
     }
     free(reg->procs);
 
@@ -932,6 +985,29 @@ const ds4_mcp_tool *ds4_mcp_registry_find(const ds4_mcp_registry *reg, const cha
     for (int i = 0; i < reg->tool_count; i++)
         if (!strcmp(reg->tools[i].wire_name, wire_name)) return &reg->tools[i];
     return NULL;
+}
+
+const char *ds4_mcp_registry_server_name(const ds4_mcp_registry *reg, int i) {
+    if (!reg || i < 0 || i >= reg->proc_count) return NULL;
+    return reg->procs[i].name;
+}
+
+bool ds4_mcp_registry_server_alive(const ds4_mcp_registry *reg, int i) {
+    if (!reg || i < 0 || i >= reg->proc_count) return false;
+    return reg->procs[i].alive;
+}
+
+long ds4_mcp_registry_server_pid(const ds4_mcp_registry *reg, int i) {
+    if (!reg || i < 0 || i >= reg->proc_count) return -1;
+    return (long)reg->procs[i].pid; /* mcp_proc_push initializes pid to -1 */
+}
+
+int ds4_mcp_registry_server_tool_count(const ds4_mcp_registry *reg, const char *server_name) {
+    if (!reg || !server_name) return 0;
+    int count = 0;
+    for (int i = 0; i < reg->tool_count; i++)
+        if (!strcmp(reg->tools[i].server_name, server_name)) count++;
+    return count;
 }
 
 char *ds4_mcp_registry_call_tool(ds4_mcp_registry *reg, const ds4_mcp_tool *tool,
@@ -1036,6 +1112,104 @@ char *ds4_mcp_registry_call_tool(ds4_mcp_registry *reg, const ds4_mcp_tool *tool
     return final_text;
 }
 
+/* Terminates one already-alive proc in place, mirroring
+ * ds4_mcp_registry_free's SIGTERM -> grace -> SIGKILL discipline but scoped
+ * to a single process group -- registry_free parallelizes the grace period
+ * across every server at once since it tears down the whole registry in one
+ * shot; ds4_mcp_registry_reconnect only ever touches one server, so a simple
+ * serial wait costs nothing extra. Safe to call on an already-dead proc
+ * (pid <= 0): a no-op past the initial check, so callers don't need to
+ * branch on the proc's current alive state first. Always leaves p->pid == -1
+ * and p->alive == false. */
+static void mcp_terminate_proc(mcp_proc *p) {
+    if (p->pid > 0) {
+        kill(-p->pid, SIGTERM);
+        struct timespec step = { 0, 10 * 1000 * 1000 }; /* 10ms */
+        bool reaped = false;
+        for (int iter = 0; iter < 30; iter++) {
+            int status;
+            pid_t r = waitpid(p->pid, &status, WNOHANG);
+            if (r == p->pid) { reaped = true; break; }
+            nanosleep(&step, NULL);
+        }
+        if (!reaped) {
+            kill(-p->pid, SIGKILL);
+            waitpid(p->pid, NULL, 0);
+        }
+        p->pid = -1;
+    }
+    p->alive = false;
+}
+
+/* Copies a mcp_warn_append-produced warn buffer into err, trimmed of its
+ * trailing newline, or a fallback string if nothing was appended to it. */
+static void mcp_err_from_warn(char *err, size_t err_len, const char *fallback, const char *warnbuf) {
+    if (!err || !err_len) return;
+    size_t wl = strlen(warnbuf);
+    while (wl > 0 && (warnbuf[wl - 1] == '\n' || warnbuf[wl - 1] == '\r')) wl--;
+    if (wl > 0) snprintf(err, err_len, "%.*s", (int)wl, warnbuf);
+    else snprintf(err, err_len, "%s", fallback);
+}
+
+bool ds4_mcp_registry_reconnect(ds4_mcp_registry *reg, const char *server_name,
+                                char *err, size_t err_len) {
+    if (err && err_len) err[0] = '\0';
+    if (!reg) {
+        if (err && err_len) snprintf(err, err_len, "no MCP servers configured");
+        return false;
+    }
+    mcp_proc *p = mcp_find_proc(reg, server_name);
+    if (!p) {
+        if (err && err_len) snprintf(err, err_len, "unknown MCP server: %s", server_name);
+        return false;
+    }
+
+    /* If alive, terminate it first; if already dead (or a zombie an earlier
+     * transport failure hasn't reaped yet), this is a harmless no-op --
+     * either way p->pid == -1 and p->alive == false afterward. */
+    mcp_terminate_proc(p);
+
+    /* Reset reader state and close old fds before respawning: a stale rbuf
+     * or malformed_count from the previous incarnation must not leak into
+     * the new one, and the old fds are meaningless once the process behind
+     * them is gone. */
+    if (p->fd_in >= 0) { close(p->fd_in); p->fd_in = -1; }
+    if (p->fd_out >= 0) { close(p->fd_out); p->fd_out = -1; }
+    free(p->rbuf);
+    p->rbuf = NULL;
+    p->rbuf_len = 0;
+    p->rbuf_cap = 0;
+    p->malformed_count = 0;
+    p->next_id = 0; /* mcp_spawn_proc resets this to 1 on a successful respawn */
+
+    if (!p->spawn_cfg.argv) {
+        /* Should not happen in practice (every proc gets a retained spec at
+         * push time, see ds4_mcp_registry_create), but a defensive check
+         * costs nothing and gives a clear error instead of a NULL argv[0]
+         * crash inside mcp_spawn_proc/execvp. */
+        if (err && err_len) snprintf(err, err_len, "no retained spawn spec for server: %s", server_name);
+        return false;
+    }
+
+    char warnbuf[256] = {0};
+    if (!mcp_spawn_proc(p, &p->spawn_cfg, warnbuf, sizeof(warnbuf))) {
+        mcp_err_from_warn(err, err_len, "respawn failed", warnbuf);
+        return false;
+    }
+
+    /* tools/list is deliberately NOT re-run here: the existing tool table
+     * (wire names, descriptions, schemas) was already advertised to the
+     * model in the system prompt for this session and is kept verbatim. See
+     * ds4_mcp_registry_reconnect's doc comment in ds4_mcp.h. */
+    warnbuf[0] = '\0';
+    if (!mcp_do_handshake(reg, p, server_name, warnbuf, sizeof(warnbuf))) {
+        mcp_err_from_warn(err, err_len, "handshake failed", warnbuf);
+        return false;
+    }
+
+    return true;
+}
+
 /* Mirrors the structural shape (schema-block JSON, native tool syntax) that
  * agent_tools_prompt_after_edit / DS4_SKILLS_TOOL_DECL use to declare every
  * other tool, so the model sees MCP tools declared the same way. */
@@ -1090,6 +1264,11 @@ int ds4_mcp_test_proc_count(const ds4_mcp_registry *reg) { return reg ? reg->pro
 pid_t ds4_mcp_test_proc_pid(const ds4_mcp_registry *reg, int i) {
     if (!reg || i < 0 || i >= reg->proc_count) return -1;
     return reg->procs[i].pid;
+}
+
+const char *ds4_mcp_test_proc_spawn_command(const ds4_mcp_registry *reg, int i) {
+    if (!reg || i < 0 || i >= reg->proc_count) return NULL;
+    return reg->procs[i].spawn_cfg.argv ? reg->procs[i].spawn_cfg.argv[0] : NULL;
 }
 
 #include <dirent.h>
@@ -1759,6 +1938,221 @@ static void test_grandchild_process_group_killed(void) {
     free(ds4dir);
 }
 
+/* Per-server accessors (ds4_mcp_registry_server_name/alive/pid/tool_count):
+ * a normal registration-order fixture (one server, two tools) plus OOB/NULL
+ * tolerance for each. */
+static void test_server_accessors(void) {
+    char *fx, *home, *saved_home;
+    ds4_config *cfg = mcp_test_setup("normal", &fx, &home, &saved_home);
+    MCP_TEST_ASSERT(cfg != NULL);
+    if (cfg) {
+        char warn[512] = {0};
+        ds4_mcp_registry *reg = ds4_mcp_registry_create(cfg, NULL, warn, sizeof(warn));
+        MCP_TEST_ASSERT(reg != NULL);
+        if (reg) {
+            MCP_TEST_ASSERT(ds4_mcp_registry_server_count(reg) == 1);
+
+            const char *name = ds4_mcp_registry_server_name(reg, 0);
+            MCP_TEST_ASSERT(name != NULL && !strcmp(name, "mock"));
+            MCP_TEST_ASSERT(ds4_mcp_registry_server_name(reg, 1) == NULL); /* OOB */
+            MCP_TEST_ASSERT(ds4_mcp_registry_server_name(NULL, 0) == NULL);
+
+            MCP_TEST_ASSERT(ds4_mcp_registry_server_alive(reg, 0) == true);
+            MCP_TEST_ASSERT(ds4_mcp_registry_server_alive(reg, 1) == false); /* OOB */
+            MCP_TEST_ASSERT(ds4_mcp_registry_server_alive(NULL, 0) == false);
+
+            MCP_TEST_ASSERT(ds4_mcp_registry_server_pid(reg, 0) > 0);
+            MCP_TEST_ASSERT(ds4_mcp_registry_server_pid(reg, 1) == -1); /* OOB */
+            MCP_TEST_ASSERT(ds4_mcp_registry_server_pid(NULL, 0) == -1);
+
+            MCP_TEST_ASSERT(ds4_mcp_registry_server_tool_count(reg, "mock") == 2);
+            MCP_TEST_ASSERT(ds4_mcp_registry_server_tool_count(reg, "nosuch") == 0);
+            MCP_TEST_ASSERT(ds4_mcp_registry_server_tool_count(reg, NULL) == 0);
+            MCP_TEST_ASSERT(ds4_mcp_registry_server_tool_count(NULL, "mock") == 0);
+        }
+        ds4_mcp_registry_free(reg);
+    }
+    ds4_config_free(cfg);
+    mcp_test_teardown(fx, home, saved_home);
+}
+
+/* Reconnect happy path against a server killed out from under the registry:
+ * spawn "normal", SIGKILL its pid directly (simulating an external crash),
+ * make one call to trigger dead-detection (mcp_mark_dead runs inside
+ * ds4_mcp_registry_call_tool's send/await path), then reconnect and confirm
+ * it comes back alive with a new pid and the retained tool table (same
+ * pointer -- tools/list is not re-fetched) still round-trips. */
+static void test_reconnect_dead_server(void) {
+    char *fx, *home, *saved_home;
+    ds4_config *cfg = mcp_test_setup("normal", &fx, &home, &saved_home);
+    MCP_TEST_ASSERT(cfg != NULL);
+    if (cfg) {
+        char warn[512] = {0};
+        ds4_mcp_registry *reg = ds4_mcp_registry_create(cfg, NULL, warn, sizeof(warn));
+        MCP_TEST_ASSERT(reg != NULL);
+        if (reg) {
+            pid_t old_pid = ds4_mcp_test_proc_pid(reg, 0);
+            MCP_TEST_ASSERT(old_pid > 0);
+            if (old_pid > 0) MCP_TEST_ASSERT(kill(old_pid, SIGKILL) == 0);
+
+            const ds4_mcp_tool *echo = ds4_mcp_registry_find(reg, "mcp__mock__echo");
+            MCP_TEST_ASSERT(echo != NULL);
+            if (echo) {
+                /* Dead-detection: the send or the await will hit EPIPE/EOF
+                 * against the killed process and mark the proc dead. */
+                char *dead_result = ds4_mcp_registry_call_tool(reg, echo, "{}");
+                MCP_TEST_ASSERT(dead_result != NULL);
+                free(dead_result);
+            }
+
+            char err[256] = {0};
+            bool ok = ds4_mcp_registry_reconnect(reg, "mock", err, sizeof(err));
+            MCP_TEST_ASSERT(ok);
+            MCP_TEST_ASSERT(err[0] == '\0');
+            MCP_TEST_ASSERT(ds4_mcp_registry_server_alive(reg, 0));
+
+            pid_t new_pid = ds4_mcp_test_proc_pid(reg, 0);
+            MCP_TEST_ASSERT(new_pid > 0);
+            MCP_TEST_ASSERT(new_pid != old_pid);
+
+            /* Tool table retained verbatim: same wire name, same entry. */
+            const ds4_mcp_tool *echo2 = ds4_mcp_registry_find(reg, "mcp__mock__echo");
+            MCP_TEST_ASSERT(echo2 == echo);
+            if (echo2) {
+                const char *names[1] = { "text" };
+                const char *values[1] = { "reborn" };
+                int is_str[1] = { 1 };
+                char *args_json = ds4_mcp_args_to_json(names, values, is_str, 1);
+                char *result = ds4_mcp_registry_call_tool(reg, echo2, args_json);
+                MCP_TEST_ASSERT(result != NULL);
+                if (result) { MCP_TEST_ASSERT(strstr(result, "reborn") != NULL); free(result); }
+                free(args_json);
+            }
+        }
+        ds4_mcp_registry_free(reg);
+    }
+    ds4_config_free(cfg);
+    mcp_test_teardown(fx, home, saved_home);
+}
+
+/* Unknown server name and a NULL registry both fail with a descriptive err
+ * and never touch anything else. */
+static void test_reconnect_unknown_name(void) {
+    char *fx, *home, *saved_home;
+    ds4_config *cfg = mcp_test_setup("normal", &fx, &home, &saved_home);
+    MCP_TEST_ASSERT(cfg != NULL);
+    if (cfg) {
+        char warn[512] = {0};
+        ds4_mcp_registry *reg = ds4_mcp_registry_create(cfg, NULL, warn, sizeof(warn));
+        MCP_TEST_ASSERT(reg != NULL);
+        if (reg) {
+            char err[256] = {0};
+            bool ok = ds4_mcp_registry_reconnect(reg, "nosuch", err, sizeof(err));
+            MCP_TEST_ASSERT(!ok);
+            MCP_TEST_ASSERT(strstr(err, "unknown MCP server: nosuch") != NULL);
+            MCP_TEST_ASSERT(ds4_mcp_registry_server_alive(reg, 0)); /* untouched */
+        }
+        ds4_mcp_registry_free(reg);
+    }
+    ds4_config_free(cfg);
+    mcp_test_teardown(fx, home, saved_home);
+
+    char err2[256] = {0};
+    MCP_TEST_ASSERT(!ds4_mcp_registry_reconnect(NULL, "mock", err2, sizeof(err2)));
+    MCP_TEST_ASSERT(strstr(err2, "no MCP servers configured") != NULL);
+}
+
+/* Reconnecting a server that is still alive: the old process (group) must be
+ * terminated -- kill(oldpid, 0) fails afterward -- and a fresh one takes its
+ * place with a working tool round-trip. */
+static void test_reconnect_while_alive(void) {
+    char *fx, *home, *saved_home;
+    ds4_config *cfg = mcp_test_setup("normal", &fx, &home, &saved_home);
+    MCP_TEST_ASSERT(cfg != NULL);
+    if (cfg) {
+        char warn[512] = {0};
+        ds4_mcp_registry *reg = ds4_mcp_registry_create(cfg, NULL, warn, sizeof(warn));
+        MCP_TEST_ASSERT(reg != NULL);
+        if (reg) {
+            pid_t old_pid = ds4_mcp_test_proc_pid(reg, 0);
+            MCP_TEST_ASSERT(old_pid > 0);
+            MCP_TEST_ASSERT(ds4_mcp_registry_server_alive(reg, 0));
+
+            char err[256] = {0};
+            bool ok = ds4_mcp_registry_reconnect(reg, "mock", err, sizeof(err));
+            MCP_TEST_ASSERT(ok);
+            MCP_TEST_ASSERT(err[0] == '\0');
+
+            if (old_pid > 0) {
+                int r = kill(old_pid, 0);
+                MCP_TEST_ASSERT(r == -1 && errno == ESRCH);
+            }
+
+            pid_t new_pid = ds4_mcp_test_proc_pid(reg, 0);
+            MCP_TEST_ASSERT(new_pid > 0);
+            MCP_TEST_ASSERT(new_pid != old_pid);
+            MCP_TEST_ASSERT(ds4_mcp_registry_server_alive(reg, 0));
+
+            const ds4_mcp_tool *echo = ds4_mcp_registry_find(reg, "mcp__mock__echo");
+            MCP_TEST_ASSERT(echo != NULL);
+            if (echo) {
+                char *result = ds4_mcp_registry_call_tool(reg, echo, "{}");
+                MCP_TEST_ASSERT(result != NULL);
+                if (result) { MCP_TEST_ASSERT(strncmp(result, "Tool error:", 11) != 0); free(result); }
+            }
+        }
+        ds4_mcp_registry_free(reg);
+    }
+    ds4_config_free(cfg);
+    mcp_test_teardown(fx, home, saved_home);
+}
+
+/* Spawn-spec retention survives the registry's whole lifetime: the retained
+ * command string (argv[0]) must still match the fixture's mock binary path,
+ * byte for byte, after several reconnects -- catches any accidental
+ * use-after-free or corruption of p->spawn_cfg (e.g. if a future edit
+ * mistakenly re-pointed it at the already-freed mcp_cfgentry_list). */
+static void test_reconnect_spawn_spec_retention(void) {
+    char *fx, *home, *saved_home;
+    ds4_config *cfg = mcp_test_setup("normal", &fx, &home, &saved_home);
+    MCP_TEST_ASSERT(cfg != NULL);
+    if (cfg) {
+        char mockpath[PATH_MAX];
+        MCP_TEST_ASSERT(realpath("tests/mock_mcp_server", mockpath) != NULL);
+
+        char warn[512] = {0};
+        ds4_mcp_registry *reg = ds4_mcp_registry_create(cfg, NULL, warn, sizeof(warn));
+        MCP_TEST_ASSERT(reg != NULL);
+        if (reg) {
+            const char *cmd0 = ds4_mcp_test_proc_spawn_command(reg, 0);
+            MCP_TEST_ASSERT(cmd0 != NULL && !strcmp(cmd0, mockpath));
+            MCP_TEST_ASSERT(ds4_mcp_test_proc_spawn_command(reg, 1) == NULL); /* OOB */
+            MCP_TEST_ASSERT(ds4_mcp_test_proc_spawn_command(NULL, 0) == NULL);
+
+            for (int i = 0; i < 3; i++) {
+                char err[256] = {0};
+                bool ok = ds4_mcp_registry_reconnect(reg, "mock", err, sizeof(err));
+                MCP_TEST_ASSERT(ok);
+                MCP_TEST_ASSERT(ds4_mcp_registry_server_alive(reg, 0));
+
+                const char *cmd = ds4_mcp_test_proc_spawn_command(reg, 0);
+                MCP_TEST_ASSERT(cmd != NULL && !strcmp(cmd, mockpath));
+
+                const ds4_mcp_tool *echo = ds4_mcp_registry_find(reg, "mcp__mock__echo");
+                MCP_TEST_ASSERT(echo != NULL);
+                if (echo) {
+                    char *result = ds4_mcp_registry_call_tool(reg, echo, "{}");
+                    MCP_TEST_ASSERT(result != NULL);
+                    free(result);
+                }
+            }
+        }
+        ds4_mcp_registry_free(reg);
+    }
+    ds4_config_free(cfg);
+    mcp_test_teardown(fx, home, saved_home);
+}
+
 int ds4_mcp_unit_tests_run(void) {
     test_normal();
     test_args_to_json();
@@ -1774,6 +2168,11 @@ int ds4_mcp_unit_tests_run(void) {
     test_registry_free_reaps();
     test_plugin_mcp_json_spawns_mock();
     test_grandchild_process_group_killed();
+    test_server_accessors();
+    test_reconnect_dead_server();
+    test_reconnect_unknown_name();
+    test_reconnect_while_alive();
+    test_reconnect_spawn_spec_retention();
     return mcp_test_failures;
 }
 #endif

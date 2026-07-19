@@ -510,7 +510,8 @@ static bool agent_slash_command_known(const char *cmd) {
         agent_slash_command_with_args(cmd, "/del") ||
         agent_slash_command_with_args(cmd, "/strip") ||
         agent_slash_command_with_args(cmd, "/history") ||
-        agent_slash_command_with_args(cmd, "/skills"))
+        agent_slash_command_with_args(cmd, "/skills") ||
+        agent_slash_command_with_args(cmd, "/mcp"))
         return true;
 
     /* cmd is the whole trimmed input line here, not just the command word --
@@ -6632,6 +6633,7 @@ static char *agent_render_skills(agent_worker *w, const char *arg);
 static char *agent_render_commands(agent_worker *w, const char *arg);
 static char *agent_render_memory(agent_worker *w, const char *arg);
 static char *agent_render_config(agent_worker *w, const char *arg);
+static char *agent_render_mcp(agent_worker *w);
 
 static void test_agent_tool_skill_dispatch(void) {
     char tmpl[] = "/tmp/ds4_agent_skill_dispatch_test.XXXXXX";
@@ -7379,6 +7381,86 @@ static void test_agent_render_config_no_project(void) {
     rmdir(fx);
 }
 
+/* agent_render_mcp with no MCP servers configured at all (w->mcp == NULL, the
+ * same state a worker started outside any .ds4/mcp.json ends up in). */
+static void test_agent_render_mcp_empty(void) {
+    agent_worker w = {0};
+    char *hint = agent_render_mcp(&w);
+    AGENT_TEST_ASSERT(hint != NULL);
+    if (hint) AGENT_TEST_ASSERT(strstr(hint, "No MCP servers configured. Add .ds4/mcp.json.") != NULL);
+    free(hint);
+}
+
+/* agent_render_mcp against a real registry: builds a fixture .ds4/mcp.json
+ * pointing "mock" at tests/mock_mcp_server (the exact fixture idiom
+ * tests/ds4_mcp_test.c uses for its own mock-backed registry tests -- this
+ * test binary links ds4_mcp.o directly, so it can drive the same public
+ * ds4_mcp_registry_create path against that same mock), then checks the
+ * rendered listing carries the server's up/pid/tool-count status line and
+ * both of its tool wire names. */
+static void test_agent_render_mcp_listing(void) {
+    char tmpl[] = "/tmp/ds4_agent_render_mcp_test.XXXXXX";
+    char *fx = mkdtemp(tmpl);
+    AGENT_TEST_ASSERT(fx != NULL);
+    if (!fx) return;
+
+    char proj[PATH_MAX], home[PATH_MAX];
+    snprintf(proj, sizeof(proj), "%s/proj", fx);
+    snprintf(home, sizeof(home), "%s/home", fx);
+
+    char ds4dir[PATH_MAX];
+    snprintf(ds4dir, sizeof(ds4dir), "%s/.ds4", proj);
+    AGENT_TEST_ASSERT(agent_mkdir_p(ds4dir));
+    AGENT_TEST_ASSERT(agent_mkdir_p(home));
+
+    char mockpath[PATH_MAX];
+    AGENT_TEST_ASSERT(realpath("tests/mock_mcp_server", mockpath) != NULL);
+
+    char mcpjson_path[PATH_MAX];
+    snprintf(mcpjson_path, sizeof(mcpjson_path), "%s/mcp.json", ds4dir);
+    FILE *fp = fopen(mcpjson_path, "wb");
+    AGENT_TEST_ASSERT(fp != NULL);
+    if (fp) {
+        fprintf(fp, "{\"mcpServers\":{\"mock\":{\"command\":\"%s\",\"args\":[\"normal\"]}}}", mockpath);
+        fclose(fp);
+    }
+
+    const char *home_save_val = getenv("HOME");
+    char *home_save = home_save_val ? xstrdup(home_save_val) : NULL;
+    setenv("HOME", home, 1);
+
+    ds4_config *cfg = ds4_config_load(proj, NULL, 0);
+    AGENT_TEST_ASSERT(cfg != NULL);
+
+    char warn[512] = {0};
+    ds4_mcp_registry *reg = cfg ? ds4_mcp_registry_create(cfg, NULL, warn, sizeof(warn)) : NULL;
+    AGENT_TEST_ASSERT(reg != NULL);
+
+    if (home_save) { setenv("HOME", home_save, 1); free(home_save); }
+    else unsetenv("HOME");
+
+    agent_worker w = {0};
+    w.mcp = reg;
+
+    char *rendered = agent_render_mcp(&w);
+    AGENT_TEST_ASSERT(rendered != NULL);
+    if (rendered) {
+        AGENT_TEST_ASSERT(strstr(rendered, "mock  [up pid ") != NULL);
+        AGENT_TEST_ASSERT(strstr(rendered, "2 tools") != NULL);
+        AGENT_TEST_ASSERT(strstr(rendered, "mcp__mock__echo") != NULL);
+        AGENT_TEST_ASSERT(strstr(rendered, "mcp__mock__add") != NULL);
+    }
+    free(rendered);
+
+    ds4_mcp_registry_free(reg);
+    ds4_config_free(cfg);
+    unlink(mcpjson_path);
+    rmdir(ds4dir);
+    rmdir(proj);
+    rmdir(home);
+    rmdir(fx);
+}
+
 /* agent_flags_conflict() is a pure function of agent_config -- no worker, no
  * engine -- so the --continue/--resume mutual exclusion check is testable
  * directly: both set is a conflict, either alone or neither is not. */
@@ -7686,6 +7768,8 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_render_memory_loaded_and_absent();
     test_agent_render_config_full();
     test_agent_render_config_no_project();
+    test_agent_render_mcp_empty();
+    test_agent_render_mcp_listing();
     test_agent_flags_conflict();
     test_agent_parse_options_resume_flags();
     test_agent_session_list_query_empty_or_missing_dir();
@@ -11358,6 +11442,65 @@ static char *agent_render_config(agent_worker *w, const char *arg) {
     return agent_input_buf_take(&buf);
 }
 
+/* Truncates desc to its first line, capped at ~80 bytes for a readable
+ * listing line, without splitting a UTF-8 sequence (mirrors ds4_mcp's own
+ * mcp_sanitize_desc truncation logic -- descriptions are already control-char/
+ * DSML-marker sanitized by the time they reach the tool table, so this is
+ * display-width truncation only, not a second sanitize pass). */
+static size_t agent_mcp_desc_line_len(const char *desc) {
+    size_t dn = strcspn(desc, "\n");
+    size_t cap = 80;
+    if (dn > cap) {
+        while (cap > 0 && ((unsigned char)desc[cap] & 0xC0) == 0x80) cap--;
+        dn = cap;
+    }
+    return dn;
+}
+
+/* /mcp: per-server status (up/dead, pid, tool count) followed by that
+ * server's tools (wire name + first line of description). Read-only; the
+ * "/mcp reconnect <server>" mutation is handled directly by the REPL
+ * dispatch arm (see run_agent's dispatch chain) since it needs to print its
+ * own success/failure feedback rather than a rendered listing. */
+static char *agent_render_mcp(agent_worker *w) {
+    int nservers = ds4_mcp_registry_server_count(w->mcp);
+    if (nservers == 0) {
+        return xstrdup("No MCP servers configured. Add .ds4/mcp.json.\n");
+    }
+
+    agent_input_buf buf = {0};
+    for (int i = 0; i < nservers; i++) {
+        const char *name = ds4_mcp_registry_server_name(w->mcp, i);
+        bool alive = ds4_mcp_registry_server_alive(w->mcp, i);
+        long pid = ds4_mcp_registry_server_pid(w->mcp, i);
+        int ntools = ds4_mcp_registry_server_tool_count(w->mcp, name);
+
+        char line[256];
+        if (alive) {
+            snprintf(line, sizeof(line), "%s  [up pid %ld]  %d tool%s\n",
+                     name, pid, ntools, ntools == 1 ? "" : "s");
+        } else {
+            snprintf(line, sizeof(line), "%s  [dead]  %d tool%s\n",
+                     name, ntools, ntools == 1 ? "" : "s");
+        }
+        agent_input_buf_append(&buf, line, strlen(line));
+
+        int ntotal = ds4_mcp_registry_tool_count(w->mcp);
+        for (int t = 0; t < ntotal; t++) {
+            const ds4_mcp_tool *tool = ds4_mcp_registry_tool_at(w->mcp, t);
+            if (strcmp(tool->server_name, name)) continue;
+
+            const char *desc = tool->description ? tool->description : "";
+            size_t dn = agent_mcp_desc_line_len(desc);
+            char toolline[400];
+            snprintf(toolline, sizeof(toolline), "  %s \xe2\x80\x94 %.*s\n",
+                     tool->wire_name, (int)dn, desc);
+            agent_input_buf_append(&buf, toolline, strlen(toolline));
+        }
+    }
+    return agent_input_buf_take(&buf);
+}
+
 static void runtime_help(void) {
     puts("Commands:");
     puts("  /help        Show this help.");
@@ -11368,6 +11511,7 @@ static void runtime_help(void) {
     puts("  /commands    List user-defined slash commands.");
     puts("  /memory      Show loaded project memory (AGENTS.md/DS4.md).");
     puts("  /config      Show effective harness configuration.");
+    puts("  /mcp [reconnect S]  Show MCP servers/tools; respawn a server.");
     puts("  /switch SHA  Load a saved session and show recent history.");
     puts("  /del SHA     Delete a saved session.");
     puts("  /strip SHA   Strip KV payload; /switch rebuilds it by prefill.");
@@ -12277,6 +12421,47 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                     if (!agent_worker_show_history(&worker, history_turns,
                                                    err, sizeof(err)))
                         printf("history failed: %s\n", err);
+                /* Bare "/mcp" is a read-only listing and could, on its own,
+                 * sit with T1's read-only introspection commands above the
+                 * busy-gate (like /commands, /memory, /config). It stays
+                 * here instead because this single arm also handles
+                 * "/mcp reconnect <server>", which mutates registry state
+                 * (kills and respawns a child process, resets its transport
+                 * state) that the worker thread reads/writes during tool
+                 * dispatch (ds4_mcp_registry_call_tool) -- reconnecting a
+                 * server the worker might be mid-call against would race.
+                 * Gating the whole command on idle, like the /switch-/del-
+                 * /strip session-mutating family above, is the simplest safe
+                 * choice; the listing half could still move to the read-only
+                 * group later if that split is ever worth making. */
+                } else if (!strncmp(cmd, "/mcp", 4) &&
+                           (cmd[4] == '\0' || cmd[4] == ' ' || cmd[4] == '\t')) {
+                    char *arg = cmd + 4;
+                    while (*arg == ' ' || *arg == '\t') arg++;
+                    if (!arg[0]) {
+                        char *rendered = agent_render_mcp(&worker);
+                        fputs(rendered, stdout);
+                        free(rendered);
+                    } else if (!strncmp(arg, "reconnect", 9) &&
+                               (arg[9] == '\0' || arg[9] == ' ' || arg[9] == '\t')) {
+                        char *name = arg + 9;
+                        while (*name == ' ' || *name == '\t') name++;
+                        if (!name[0]) {
+                            printf("usage: /mcp reconnect <server>\n");
+                        } else {
+                            char *end = name;
+                            while (*end && *end != ' ' && *end != '\t') end++;
+                            if (*end) *end = '\0';
+                            char err[256] = {0};
+                            if (ds4_mcp_registry_reconnect(worker.mcp, name, err, sizeof(err)))
+                                printf("reconnected %s (tool list retained; restart session to refresh tools)\n",
+                                       name);
+                            else
+                                printf("reconnect failed: %s\n", err);
+                        }
+                    } else {
+                        printf("usage: /mcp [reconnect <server>]\n");
+                    }
                 } else if (cmd[0] == '/' &&
                            agent_split_first_word(cmd, cmdword, sizeof(cmdword), &cmdargs) &&
                            ds4_commands_known(&g_agent_commands, cmdword)) {
